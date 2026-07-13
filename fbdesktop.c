@@ -1,28 +1,46 @@
-/* Minimal framebuffer desktop: clickable icons that run shell commands.
- * No X11, no browser -- draws directly to /dev/fb0, reads /dev/input/mice.
- * Font is pulled live from the kernel's own VT console font (GIO_FONT),
- * so no font data is embedded here. */
+/* Minimal framebuffer desktop: every icon opens a draggable/resizable window
+ * (a real pty-backed VT100-ish terminal, or a one-shot command-output view),
+ * plus a taskbar. No X11, no browser -- draws directly to /dev/fb0, reads
+ * mouse from /dev/input/mice and keyboard from stdin in raw mode.
+ * Font is pulled live from the kernel's own VT console font (KDFONTOP). */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/kd.h>
 
 #define ICON_W 140
 #define ICON_H 90
 #define ICON_GAP 30
+#define TITLE_H 24
+#define TASK_H 32
+#define MAX_WIN 8
+#define WIN_MINW 240
+#define WIN_MINH 150
+#define GRID_MAXCOLS 220
+#define GRID_MAXROWS 110
+#define COL_FG_DEFAULT 0xcdd6f4
+#define COL_BG_DEFAULT 0x1e1e2e
+
+enum wintype { WIN_TERM, WIN_OUTPUT };
 
 struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 0=run+show output, 1=reboot, 2=poweroff */
+	int action; /* 0=open output window, 1=reboot, 2=poweroff, 3=spawn terminal */
 };
 
 static struct icon icons[] = {
@@ -30,11 +48,41 @@ static struct icon icons[] = {
 	{"PROCESSES", "ps aux", 0x22c55e, 0},
 	{"DISK",      "df -h", 0xeab308, 0},
 	{"MEMORY",    "free -m", 0xf97316, 0},
-	{"DMESG",     "dmesg | tail -30", 0x14b8a6, 0},
+	{"DMESG",     "dmesg | tail -40", 0x14b8a6, 0},
+	{"TERMINAL",  NULL, 0x9333ea, 3},
 	{"REBOOT",    NULL, 0xef4444, 1},
 	{"POWER OFF", NULL, 0xf43f5e, 2},
 };
 #define NUM_ICONS (int)(sizeof(icons)/sizeof(icons[0]))
+
+struct window {
+	int used;
+	enum wintype type;
+	int x, y, w, h;
+	int rx, ry, rw, rh; /* saved geometry for un-maximize */
+	int minimized, maximized;
+	char title[32];
+
+	int pty_fd;
+	pid_t pid;
+
+	int cols, rows;
+	unsigned char gch[GRID_MAXROWS][GRID_MAXCOLS];
+	uint32_t gfg[GRID_MAXROWS][GRID_MAXCOLS];
+	uint32_t gbg[GRID_MAXROWS][GRID_MAXCOLS];
+	int cur_row, cur_col;
+	uint32_t attr_fg, attr_bg;
+
+	int esc_state; /* 0 normal,1 ESC,2 CSI,3 OSC,4 charset-select,5 OSC-ST-wait */
+	int csi_params[8];
+	int csi_nparams;
+};
+
+static struct window wins[MAX_WIN];
+static int zorder[MAX_WIN], zcount;
+static int focused = -1;
+static int drag_mode; /* 0 none, 1 move, 2 resize */
+static int drag_win = -1;
 
 static uint8_t *fbp;
 static struct fb_var_screeninfo vinfo;
@@ -42,7 +90,12 @@ static struct fb_fix_screeninfo finfo;
 static int xres, yres, bpp, line_length;
 static unsigned char font[512 * 32 * 4];
 static int have_font;
-static int font_w = 8, font_h = 16, font_bpr = 1; /* bytes per row */
+static int font_w = 8, font_h = 16, font_bpr = 1;
+static int mx, my, prev_left;
+static FILE *dbg;
+static struct termios orig_termios;
+static int have_orig_termios;
+#define DBG(...) do { if (dbg) fprintf(dbg, __VA_ARGS__); } while (0)
 
 static void put_pixel(int x, int y, uint32_t color)
 {
@@ -102,31 +155,49 @@ static void draw_text(int x, int y, const char *s, uint32_t fg)
 	}
 }
 
-static void draw_desktop(void)
+static void draw_text_clip(int x, int y, const char *s, uint32_t fg, int maxw)
 {
-	fill_rect(0, 0, xres, yres, 0x181825);
+	char buf[64];
+	int maxchars = maxw / font_w;
+	if (maxchars < 0)
+		maxchars = 0;
+	if (maxchars >= (int)sizeof(buf))
+		maxchars = sizeof(buf) - 1;
+	int n = strlen(s);
+	if (n > maxchars)
+		n = maxchars;
+	memcpy(buf, s, n);
+	buf[n] = 0;
+	draw_text(x, y, buf, fg);
+}
+
+static int icon_grid_xy(int i, int *ox, int *oy)
+{
 	int cols = (xres - ICON_GAP) / (ICON_W + ICON_GAP);
 	if (cols < 1)
 		cols = 1;
+	int col = i % cols, row = i / cols;
+	*ox = ICON_GAP + col * (ICON_W + ICON_GAP);
+	*oy = ICON_GAP + row * (ICON_H + ICON_GAP);
+	return cols;
+}
+
+static void draw_icons(void)
+{
 	for (int i = 0; i < NUM_ICONS; i++) {
-		int col = i % cols, row = i / cols;
-		int x = ICON_GAP + col * (ICON_W + ICON_GAP);
-		int y = ICON_GAP + row * (ICON_H + ICON_GAP);
+		int x, y;
+		icon_grid_xy(i, &x, &y);
 		fill_rect(x, y, ICON_W, ICON_H, icons[i].color);
 		draw_text(x + 8, y + ICON_H / 2 - font_h / 2, icons[i].label, 0xffffff);
 	}
 }
 
-static int icon_at(int mx, int my)
+static int icon_at(int px, int py)
 {
-	int cols = (xres - ICON_GAP) / (ICON_W + ICON_GAP);
-	if (cols < 1)
-		cols = 1;
 	for (int i = 0; i < NUM_ICONS; i++) {
-		int col = i % cols, row = i / cols;
-		int x = ICON_GAP + col * (ICON_W + ICON_GAP);
-		int y = ICON_GAP + row * (ICON_H + ICON_GAP);
-		if (mx >= x && mx < x + ICON_W && my >= y && my < y + ICON_H)
+		int x, y;
+		icon_grid_xy(i, &x, &y);
+		if (px >= x && px < x + ICON_W && py >= y && py < y + ICON_H)
 			return i;
 	}
 	return -1;
@@ -136,6 +207,198 @@ static void draw_cursor(int x, int y)
 {
 	fill_rect(x - 1, y - 6, 2, 12, 0xffffff);
 	fill_rect(x - 6, y - 1, 12, 2, 0xffffff);
+}
+
+/* ---- character-grid terminal model, shared by live terminals and
+ * one-shot command-output windows ---- */
+
+static void update_grid_dims(struct window *w)
+{
+	int content_h = w->h - TITLE_H;
+	int newcols = (w->w - 8) / font_w;
+	int newrows = content_h / font_h;
+	if (newcols > GRID_MAXCOLS) newcols = GRID_MAXCOLS;
+	if (newrows > GRID_MAXROWS) newrows = GRID_MAXROWS;
+	if (newcols < 1) newcols = 1;
+	if (newrows < 1) newrows = 1;
+	w->cols = newcols;
+	w->rows = newrows;
+	if (w->cur_row >= w->rows) w->cur_row = w->rows - 1;
+	if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
+}
+
+static void resize_notify(struct window *w)
+{
+	update_grid_dims(w);
+	if (w->type == WIN_TERM && w->pty_fd >= 0) {
+		struct winsize ws;
+		memset(&ws, 0, sizeof(ws));
+		ws.ws_row = w->rows;
+		ws.ws_col = w->cols;
+		ioctl(w->pty_fd, TIOCSWINSZ, &ws);
+		if (w->pid > 0)
+			kill(w->pid, SIGWINCH);
+	}
+}
+
+static void clear_row_range(struct window *w, int row, int from, int to)
+{
+	for (int c = from; c <= to && c < w->cols; c++) {
+		w->gch[row][c] = ' ';
+		w->gfg[row][c] = w->attr_fg;
+		w->gbg[row][c] = w->attr_bg;
+	}
+}
+
+static void scroll_up(struct window *w)
+{
+	for (int r = 0; r < w->rows - 1; r++) {
+		memcpy(w->gch[r], w->gch[r + 1], sizeof(w->gch[r]));
+		memcpy(w->gfg[r], w->gfg[r + 1], sizeof(w->gfg[r]));
+		memcpy(w->gbg[r], w->gbg[r + 1], sizeof(w->gbg[r]));
+	}
+	clear_row_range(w, w->rows - 1, 0, w->cols - 1);
+}
+
+static void erase_line(struct window *w, int mode)
+{
+	int from = 0, to = w->cols - 1;
+	if (mode == 0) from = w->cur_col;
+	else if (mode == 1) to = w->cur_col;
+	clear_row_range(w, w->cur_row, from, to);
+}
+
+static void erase_screen(struct window *w, int mode)
+{
+	int rfrom = 0, rto = w->rows - 1;
+	if (mode == 0) {
+		erase_line(w, 0);
+		rfrom = w->cur_row + 1;
+	} else if (mode == 1) {
+		erase_line(w, 1);
+		rto = w->cur_row - 1;
+	}
+	for (int r = rfrom; r <= rto && r >= 0 && r < w->rows; r++)
+		clear_row_range(w, r, 0, w->cols - 1);
+}
+
+static void putch_grid(struct window *w, unsigned char c)
+{
+	if (w->cur_col >= w->cols) {
+		w->cur_col = 0;
+		w->cur_row++;
+	}
+	if (w->cur_row >= w->rows) {
+		scroll_up(w);
+		w->cur_row = w->rows - 1;
+	}
+	w->gch[w->cur_row][w->cur_col] = c;
+	w->gfg[w->cur_row][w->cur_col] = w->attr_fg;
+	w->gbg[w->cur_row][w->cur_col] = w->attr_bg;
+	w->cur_col++;
+}
+
+static void apply_sgr(struct window *w, int *params, int n)
+{
+	static const uint32_t palette[8] = {
+		0x11111b, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+		0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xcdd6f4,
+	};
+	if (n == 0) {
+		w->attr_fg = COL_FG_DEFAULT;
+		w->attr_bg = COL_BG_DEFAULT;
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		int p = params[i];
+		if (p == 0) { w->attr_fg = COL_FG_DEFAULT; w->attr_bg = COL_BG_DEFAULT; }
+		else if (p >= 30 && p <= 37) w->attr_fg = palette[p - 30];
+		else if (p == 39) w->attr_fg = COL_FG_DEFAULT;
+		else if (p >= 40 && p <= 47) w->attr_bg = palette[p - 40];
+		else if (p == 49) w->attr_bg = COL_BG_DEFAULT;
+		else if (p >= 90 && p <= 97) w->attr_fg = palette[p - 90];
+		else if (p >= 100 && p <= 107) w->attr_bg = palette[p - 100];
+		/* bold/underline/etc: not tracked -- known simplification */
+	}
+}
+
+/* Handles a pragmatic subset of VT100/ANSI: cursor motion, absolute
+ * positioning, erase line/screen, SGR colors, and OSC/charset escapes are
+ * consumed harmlessly. No alternate screen buffer, no scrollback beyond the
+ * grid -- full-screen apps that rely on those (vi, top) will be usable but
+ * imperfect. That's the accepted ceiling for this size of program. */
+static void process_bytes(struct window *w, unsigned char *buf, int n)
+{
+	for (int i = 0; i < n; i++) {
+		unsigned char c = buf[i];
+		if (w->esc_state == 1) {
+			if (c == '[') { w->esc_state = 2; w->csi_nparams = 0; w->csi_params[0] = 0; }
+			else if (c == ']') w->esc_state = 3;
+			else if (c == '(' || c == ')') w->esc_state = 4;
+			else w->esc_state = 0;
+			continue;
+		}
+		if (w->esc_state == 2) {
+			if (c == '?') continue;
+			if (c >= '0' && c <= '9') {
+				w->csi_params[w->csi_nparams] = w->csi_params[w->csi_nparams] * 10 + (c - '0');
+				continue;
+			}
+			if (c == ';') {
+				if (w->csi_nparams < 7) w->csi_nparams++;
+				w->csi_params[w->csi_nparams] = 0;
+				continue;
+			}
+			int nparams = w->csi_nparams + 1;
+			int *p = w->csi_params;
+			int p0 = p[0];
+			switch (c) {
+			case 'A': w->cur_row -= p0 ? p0 : 1; if (w->cur_row < 0) w->cur_row = 0; break;
+			case 'B': w->cur_row += p0 ? p0 : 1; if (w->cur_row >= w->rows) w->cur_row = w->rows - 1; break;
+			case 'C': w->cur_col += p0 ? p0 : 1; if (w->cur_col >= w->cols) w->cur_col = w->cols - 1; break;
+			case 'D': w->cur_col -= p0 ? p0 : 1; if (w->cur_col < 0) w->cur_col = 0; break;
+			case 'H': case 'f': {
+				int row = (nparams > 0 && p[0]) ? p[0] : 1;
+				int col = (nparams > 1 && p[1]) ? p[1] : 1;
+				w->cur_row = row - 1;
+				w->cur_col = col - 1;
+				if (w->cur_row < 0) w->cur_row = 0;
+				if (w->cur_row >= w->rows) w->cur_row = w->rows - 1;
+				if (w->cur_col < 0) w->cur_col = 0;
+				if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
+				break;
+			}
+			case 'J': erase_screen(w, p0); break;
+			case 'K': erase_line(w, p0); break;
+			case 'm': apply_sgr(w, p, nparams); break;
+			default: break;
+			}
+			w->esc_state = 0;
+			continue;
+		}
+		if (w->esc_state == 3) {
+			if (c == 0x07) w->esc_state = 0;
+			else if (c == 0x1b) w->esc_state = 5;
+			continue;
+		}
+		if (w->esc_state == 5) { w->esc_state = 0; continue; }
+		if (w->esc_state == 4) { w->esc_state = 0; continue; }
+
+		if (c == 0x1b) { w->esc_state = 1; continue; }
+		if (c == '\r') { w->cur_col = 0; continue; }
+		if (c == '\n') {
+			w->cur_row++;
+			if (w->cur_row >= w->rows) { scroll_up(w); w->cur_row = w->rows - 1; }
+			continue;
+		}
+		if (c == '\b') { if (w->cur_col > 0) w->cur_col--; continue; }
+		if (c == '\t') {
+			w->cur_col = (w->cur_col / 8 + 1) * 8;
+			if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
+			continue;
+		}
+		if (c >= 0x20 && c < 0x7f) { putch_grid(w, c); continue; }
+	}
 }
 
 static void run_and_show(const char *cmd)
@@ -154,7 +417,397 @@ static void run_and_show(const char *cmd)
 		}
 		pclose(p);
 	}
-	draw_text(10, yres - font_h - 10, "-- click anywhere to go back --", 0x89b4fa);
+}
+
+static void raise_window(int i)
+{
+	for (int zi = 0; zi < zcount; zi++) {
+		if (zorder[zi] == i) {
+			for (int k = zi; k < zcount - 1; k++)
+				zorder[k] = zorder[k + 1];
+			zcount--;
+			break;
+		}
+	}
+	zorder[zcount++] = i;
+}
+
+static void close_window(int i)
+{
+	if (!wins[i].used)
+		return;
+	if (wins[i].type == WIN_TERM) {
+		close(wins[i].pty_fd);
+		if (wins[i].pid > 0) {
+			kill(wins[i].pid, SIGTERM);
+			waitpid(wins[i].pid, NULL, 0);
+		}
+	}
+	wins[i].used = 0;
+	for (int zi = 0; zi < zcount; zi++) {
+		if (zorder[zi] == i) {
+			for (int k = zi; k < zcount - 1; k++)
+				zorder[k] = zorder[k + 1];
+			zcount--;
+			break;
+		}
+	}
+	if (focused == i)
+		focused = zcount > 0 ? zorder[zcount - 1] : -1;
+	if (drag_win == i) {
+		drag_win = -1;
+		drag_mode = 0;
+	}
+}
+
+static void toggle_maximize(int i)
+{
+	struct window *w = &wins[i];
+	if (!w->maximized) {
+		w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
+		w->x = 0; w->y = 0; w->w = xres; w->h = yres - TASK_H;
+		w->maximized = 1;
+	} else {
+		w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh;
+		w->maximized = 0;
+	}
+	resize_notify(w);
+}
+
+static int alloc_window_slot(void)
+{
+	for (int i = 0; i < MAX_WIN; i++)
+		if (!wins[i].used)
+			return i;
+	return -1;
+}
+
+static int spawn_terminal(void)
+{
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+
+	int master = posix_openpt(O_RDWR | O_NOCTTY);
+	if (master < 0)
+		return -1;
+	if (grantpt(master) < 0 || unlockpt(master) < 0) {
+		close(master);
+		return -1;
+	}
+	char *slavename = ptsname(master);
+	if (!slavename) {
+		close(master);
+		return -1;
+	}
+	char slavebuf[64];
+	strncpy(slavebuf, slavename, sizeof(slavebuf) - 1);
+	slavebuf[sizeof(slavebuf) - 1] = 0;
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		setsid();
+		int slave = open(slavebuf, O_RDWR);
+		if (slave < 0)
+			_exit(1);
+		ioctl(slave, TIOCSCTTY, 0);
+		dup2(slave, 0);
+		dup2(slave, 1);
+		dup2(slave, 2);
+		if (slave > 2)
+			close(slave);
+		close(master);
+		for (int i = 0; i < MAX_WIN; i++)
+			if (i != slot && wins[i].used && wins[i].type == WIN_TERM)
+				close(wins[i].pty_fd);
+		setenv("TERM", "linux", 1);
+		execl("/bin/sh", "sh", NULL);
+		_exit(1);
+	} else if (pid < 0) {
+		close(master);
+		return -1;
+	}
+
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_TERM;
+	wins[slot].pty_fd = master;
+	wins[slot].pid = pid;
+	wins[slot].x = 200 + slot * 24;
+	wins[slot].y = 120 + slot * 24;
+	wins[slot].w = 560;
+	wins[slot].h = 360;
+	wins[slot].attr_fg = COL_FG_DEFAULT;
+	wins[slot].attr_bg = COL_BG_DEFAULT;
+	snprintf(wins[slot].title, sizeof(wins[slot].title), "Terminal %d", slot + 1);
+	update_grid_dims(&wins[slot]);
+	for (int r = 0; r < wins[slot].rows; r++)
+		clear_row_range(&wins[slot], r, 0, wins[slot].cols - 1);
+	resize_notify(&wins[slot]);
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+static int spawn_output_window(const char *title, const char *cmd)
+{
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_OUTPUT;
+	wins[slot].pty_fd = -1;
+	wins[slot].x = 220 + slot * 24;
+	wins[slot].y = 140 + slot * 24;
+	wins[slot].w = 560;
+	wins[slot].h = 380;
+	wins[slot].attr_fg = COL_FG_DEFAULT;
+	wins[slot].attr_bg = COL_BG_DEFAULT;
+	snprintf(wins[slot].title, sizeof(wins[slot].title), "%s", title);
+	update_grid_dims(&wins[slot]);
+	struct window *w = &wins[slot];
+	for (int r = 0; r < w->rows; r++)
+		clear_row_range(w, r, 0, w->cols - 1);
+
+	FILE *p = popen(cmd, "r");
+	if (p) {
+		int ch;
+		while ((ch = fgetc(p)) != EOF) {
+			unsigned char c = (unsigned char)ch;
+			if (c == '\r') continue;
+			if (c == '\n') {
+				w->cur_row++;
+				w->cur_col = 0;
+				if (w->cur_row >= w->rows) { scroll_up(w); w->cur_row = w->rows - 1; }
+				continue;
+			}
+			putch_grid(w, c);
+		}
+		pclose(p);
+	}
+	w->cur_row = 0;
+	w->cur_col = 0;
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+static void draw_window(struct window *w)
+{
+	fill_rect(w->x, w->y, w->w, TITLE_H, 0x313244);
+	draw_text_clip(w->x + 6, w->y + 4, w->title, 0xffffff, w->w - 80);
+
+	int bx = w->x + w->w - 24;
+	fill_rect(bx, w->y, 24, TITLE_H, 0xef4444);
+	draw_text(bx + 8, w->y + 4, "X", 0xffffff);
+	bx -= 24;
+	fill_rect(bx, w->y, 24, TITLE_H, 0x45475a);
+	draw_text(bx + 8, w->y + 4, "^", 0xffffff);
+	bx -= 24;
+	fill_rect(bx, w->y, 24, TITLE_H, 0x45475a);
+	draw_text(bx + 8, w->y + 4, "_", 0xffffff);
+
+	int content_y = w->y + TITLE_H, content_h = w->h - TITLE_H;
+	if (content_h < 0)
+		content_h = 0;
+	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
+
+	for (int r = 0; r < w->rows; r++) {
+		int cy = content_y + r * font_h;
+		for (int c = 0; c < w->cols; c++) {
+			uint32_t bg = w->gbg[r][c];
+			if (bg != COL_BG_DEFAULT)
+				fill_rect(w->x + 4 + c * font_w, cy, font_w, font_h, bg);
+		}
+	}
+	for (int r = 0; r < w->rows; r++) {
+		int cy = content_y + r * font_h;
+		for (int c = 0; c < w->cols; c++) {
+			unsigned char ch = w->gch[r][c];
+			if (ch && ch != ' ')
+				blit_char(w->x + 4 + c * font_w, cy, ch, w->gfg[r][c]);
+		}
+	}
+	if (w->type == WIN_TERM) {
+		int cx = w->x + 4 + w->cur_col * font_w;
+		int cy = content_y + w->cur_row * font_h + font_h - 2;
+		fill_rect(cx, cy, font_w, 2, 0xf9e2af);
+	}
+
+	if (!w->maximized)
+		fill_rect(w->x + w->w - 10, w->y + w->h - 10, 10, 10, 0x585b70);
+}
+
+static void draw_taskbar(void)
+{
+	fill_rect(0, yres - TASK_H, xres, TASK_H, 0x11111b);
+	int bx = 4;
+	for (int zi = 0; zi < zcount; zi++) {
+		int i = zorder[zi];
+		if (!wins[i].used)
+			continue;
+		int bw = 130;
+		uint32_t bg = (i == focused && !wins[i].minimized) ? 0x45475a : 0x313244;
+		fill_rect(bx, yres - TASK_H + 4, bw, TASK_H - 8, bg);
+		draw_text_clip(bx + 6, yres - TASK_H + 4 + (TASK_H - 8 - font_h) / 2, wins[i].title, 0xffffff, bw - 12);
+		bx += bw + 6;
+	}
+}
+
+static void redraw_all(void)
+{
+	fill_rect(0, 0, xres, yres - TASK_H, 0x181825);
+	draw_icons();
+	for (int zi = 0; zi < zcount; zi++) {
+		int i = zorder[zi];
+		if (wins[i].used && !wins[i].minimized)
+			draw_window(&wins[i]);
+	}
+	draw_taskbar();
+	draw_cursor(mx, my);
+}
+
+static void clamp_window(struct window *w)
+{
+	if (w->x < -w->w + 40) w->x = -w->w + 40;
+	if (w->y < 0) w->y = 0;
+	if (w->x > xres - 40) w->x = xres - 40;
+	if (w->y > yres - TASK_H - TITLE_H) w->y = yres - TASK_H - TITLE_H;
+}
+
+static void do_hit_test(int x, int y)
+{
+	if (y >= yres - TASK_H) {
+		int bx = 4;
+		for (int zi = 0; zi < zcount; zi++) {
+			int i = zorder[zi];
+			if (!wins[i].used)
+				continue;
+			int bw = 130;
+			if (x >= bx && x < bx + bw) {
+				wins[i].minimized = 0;
+				raise_window(i);
+				focused = i;
+				return;
+			}
+			bx += bw + 6;
+		}
+		return;
+	}
+
+	for (int zi = zcount - 1; zi >= 0; zi--) {
+		int i = zorder[zi];
+		if (!wins[i].used || wins[i].minimized)
+			continue;
+		struct window *w = &wins[i];
+		if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) {
+			if (y < w->y + TITLE_H) {
+				int closeX = w->x + w->w - 24;
+				int maxX = closeX - 24;
+				int minX = maxX - 24;
+				if (x >= closeX) {
+					close_window(i);
+				} else if (x >= maxX) {
+					raise_window(i);
+					focused = i;
+					toggle_maximize(i);
+				} else if (x >= minX) {
+					wins[i].minimized = 1;
+				} else {
+					raise_window(i);
+					focused = i;
+					drag_mode = 1;
+					drag_win = i;
+				}
+				return;
+			} else if (!w->maximized && x >= w->x + w->w - 10 && y >= w->y + w->h - 10) {
+				raise_window(i);
+				focused = i;
+				drag_mode = 2;
+				drag_win = i;
+				return;
+			} else {
+				raise_window(i);
+				focused = i;
+				return;
+			}
+		}
+	}
+
+	int idx = icon_at(x, y);
+	if (idx >= 0) {
+		struct icon *ic = &icons[idx];
+		if (ic->action == 1) {
+			run_and_show("echo Rebooting...");
+			usleep(500000);
+			system("reboot");
+		} else if (ic->action == 2) {
+			run_and_show("echo Powering off...");
+			usleep(500000);
+			system("poweroff -f");
+		} else if (ic->action == 3) {
+			spawn_terminal();
+		} else {
+			spawn_output_window(ic->label, ic->cmd);
+		}
+	}
+}
+
+static void handle_mouse_packet(unsigned char *pkt)
+{
+	int left = pkt[0] & 0x1;
+	int dx = pkt[1];
+	int dy = pkt[2];
+	if (pkt[0] & 0x10) dx -= 256;
+	if (pkt[0] & 0x20) dy -= 256;
+	dy = -dy;
+	mx += dx;
+	my += dy;
+	if (mx < 0) mx = 0;
+	if (my < 0) my = 0;
+	if (mx >= xres) mx = xres - 1;
+	if (my >= yres) my = yres - 1;
+
+	if (left && drag_mode == 1 && drag_win >= 0 && wins[drag_win].used) {
+		wins[drag_win].x += dx;
+		wins[drag_win].y += dy;
+		clamp_window(&wins[drag_win]);
+	} else if (left && drag_mode == 2 && drag_win >= 0 && wins[drag_win].used) {
+		wins[drag_win].w += dx;
+		wins[drag_win].h += dy;
+		if (wins[drag_win].w < WIN_MINW) wins[drag_win].w = WIN_MINW;
+		if (wins[drag_win].h < WIN_MINH) wins[drag_win].h = WIN_MINH;
+		resize_notify(&wins[drag_win]);
+	} else if (left && !prev_left) {
+		do_hit_test(mx, my);
+	}
+	if (!left) {
+		if (drag_mode == 2 && drag_win >= 0 && wins[drag_win].used)
+			resize_notify(&wins[drag_win]);
+		drag_mode = 0;
+		drag_win = -1;
+	}
+	prev_left = left;
+}
+
+static void setup_raw_stdin(void)
+{
+	if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
+		have_orig_termios = 1;
+		struct termios raw = orig_termios;
+		raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+		raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
+		raw.c_cc[VMIN] = 0;
+		raw.c_cc[VTIME] = 0;
+		tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+	}
+}
+
+static void restore_stdin(void)
+{
+	if (have_orig_termios)
+		tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
 }
 
 int main(void)
@@ -177,13 +830,11 @@ int main(void)
 		return 1;
 	}
 
-	FILE *dbg = fopen("/dev/ttyS0", "w");
+	dbg = fopen("/dev/ttyS0", "w");
 	if (dbg)
 		setvbuf(dbg, NULL, _IONBF, 0);
-#define DBG(...) do { if (dbg) fprintf(dbg, __VA_ARGS__); } while (0)
 
 	int confd = open("/dev/tty1", O_RDWR);
-	DBG("[fbdesktop] confd=%d errno=%d\n", confd, confd < 0 ? errno : 0);
 	if (confd >= 0) {
 		struct console_font_op op;
 		memset(&op, 0, sizeof(op));
@@ -193,8 +844,6 @@ int main(void)
 		op.charcount = 512;
 		op.data = font;
 		int r = ioctl(confd, KDFONTOP, &op);
-		DBG("[fbdesktop] KDFONTOP r=%d errno=%d w=%u h=%u count=%u\n",
-			r, r < 0 ? errno : 0, op.width, op.height, op.charcount);
 		have_font = r == 0;
 		if (have_font) {
 			font_w = op.width;
@@ -203,70 +852,86 @@ int main(void)
 		}
 		ioctl(confd, KDSETMODE, KD_GRAPHICS);
 	}
+	setup_raw_stdin();
 	DBG("[fbdesktop] xres=%d yres=%d bpp=%d have_font=%d font_w=%d font_h=%d\n",
 		xres, yres, bpp, have_font, font_w, font_h);
 
 	int mousefd = open("/dev/input/mice", O_RDONLY);
 
-	int mx = xres / 2, my = yres / 2;
-	int prev_left = 0;
-	int showing_output = 0;
+	mx = xres / 2;
+	my = yres / 2;
 
-	draw_desktop();
-	draw_cursor(mx, my);
+	signal(SIGCHLD, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 
-	if (mousefd >= 0) {
-		unsigned char pkt[3];
-		while (read(mousefd, pkt, 3) == 3) {
-			int left = pkt[0] & 0x1;
-			int dx = pkt[1];
-			int dy = pkt[2];
-			if (pkt[0] & 0x10)
-				dx -= 256;
-			if (pkt[0] & 0x20)
-				dy -= 256;
-			int old_mx = mx, old_my = my;
-			mx += dx;
-			my -= dy;
-			if (mx < 0) mx = 0;
-			if (my < 0) my = 0;
-			if (mx >= xres) mx = xres - 1;
-			if (my >= yres) my = yres - 1;
+	redraw_all();
 
-			if (left && !prev_left) {
-				if (showing_output) {
-					showing_output = 0;
-					draw_desktop();
-				} else {
-					int idx = icon_at(mx, my);
-					if (idx >= 0) {
-						struct icon *ic = &icons[idx];
-						if (ic->action == 1) {
-							draw_text(10, 10, "Rebooting...", 0xffffff);
-							usleep(500000);
-							system("reboot");
-						} else if (ic->action == 2) {
-							draw_text(10, 10, "Powering off...", 0xffffff);
-							usleep(500000);
-							system("poweroff -f");
-						} else {
-							run_and_show(ic->cmd);
-							showing_output = 1;
-						}
-					}
-				}
-			}
-			prev_left = left;
-
-			if (!showing_output && (old_mx != mx || old_my != my)) {
-				draw_desktop();
-				draw_cursor(mx, my);
-			} else if (!showing_output) {
-				draw_cursor(mx, my);
+	for (;;) {
+		struct pollfd fds[2 + MAX_WIN];
+		int n = 0;
+		int mouse_i = -1, kbd_i;
+		if (mousefd >= 0) {
+			mouse_i = n;
+			fds[n].fd = mousefd;
+			fds[n].events = POLLIN;
+			n++;
+		}
+		kbd_i = n;
+		fds[n].fd = STDIN_FILENO;
+		fds[n].events = POLLIN;
+		n++;
+		int win_i[MAX_WIN];
+		for (int i = 0; i < MAX_WIN; i++) {
+			win_i[i] = -1;
+			if (wins[i].used && wins[i].type == WIN_TERM) {
+				win_i[i] = n;
+				fds[n].fd = wins[i].pty_fd;
+				fds[n].events = POLLIN;
+				n++;
 			}
 		}
+
+		int pr = poll(fds, n, -1);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+
+		int need_redraw = 0;
+
+		if (mouse_i >= 0 && (fds[mouse_i].revents & POLLIN)) {
+			unsigned char pkt[3];
+			if (read(mousefd, pkt, 3) == 3) {
+				handle_mouse_packet(pkt);
+				need_redraw = 1;
+			}
+		}
+		if (fds[kbd_i].revents & POLLIN) {
+			char buf[64];
+			int r = read(STDIN_FILENO, buf, sizeof(buf));
+			if (r > 0 && focused >= 0 && wins[focused].used && wins[focused].type == WIN_TERM)
+				write(wins[focused].pty_fd, buf, r);
+		}
+		for (int i = 0; i < MAX_WIN; i++) {
+			if (win_i[i] >= 0 && (fds[win_i[i]].revents & (POLLIN | POLLHUP))) {
+				char buf[1024];
+				int r = read(wins[i].pty_fd, buf, sizeof(buf));
+				if (r > 0) {
+					process_bytes(&wins[i], (unsigned char *)buf, r);
+					need_redraw = 1;
+				} else {
+					close_window(i);
+					need_redraw = 1;
+				}
+			}
+		}
+
+		if (need_redraw)
+			redraw_all();
 	}
 
+	restore_stdin();
 	if (confd >= 0)
 		ioctl(confd, KDSETMODE, KD_TEXT);
 	return 0;

@@ -17,6 +17,8 @@ cat > "$ROOT/init" <<'EOF'
 /bin/busybox mount -t proc none /proc
 /bin/busybox mount -t sysfs none /sys
 /bin/busybox mount -t devtmpfs none /dev
+/bin/busybox mkdir -p /dev/pts
+/bin/busybox mount -t devpts none /dev/pts
 echo "=================================================="
 echo " Custom Linux fork - built from linux-giamat source"
 echo "=================================================="
