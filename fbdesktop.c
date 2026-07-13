@@ -14,12 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/kd.h>
+#include <linux/input.h>
+
+#define test_bit(nr, arr) (((arr)[(nr) / 8] >> ((nr) % 8)) & 1)
 
 #define ICON_W 140
 #define ICON_H 90
@@ -83,8 +87,10 @@ static int zorder[MAX_WIN], zcount;
 static int focused = -1;
 static int drag_mode; /* 0 none, 1 move, 2 resize */
 static int drag_win = -1;
+static int alt_held;
 
-static uint8_t *fbp;
+static uint8_t *fbp;      /* real framebuffer */
+static uint8_t *backbuf;  /* offscreen: draw here, then flush in one memcpy */
 static struct fb_var_screeninfo vinfo;
 static struct fb_fix_screeninfo finfo;
 static int xres, yres, bpp, line_length;
@@ -92,6 +98,10 @@ static unsigned char font[512 * 32 * 4];
 static int have_font;
 static int font_w = 8, font_h = 16, font_bpr = 1;
 static int mx, my, prev_left;
+/* absolute pointer (evdev tablet) + evdev keyboard for Alt+Tab */
+static int absptr_fd = -1, kbd_evdev_fd = -1;
+static int abs_minx, abs_maxx, abs_miny, abs_maxy;
+static int abs_curx, abs_cury, abs_btn;
 static FILE *dbg;
 static struct termios orig_termios;
 static int have_orig_termios;
@@ -101,17 +111,18 @@ static void put_pixel(int x, int y, uint32_t color)
 {
 	if (x < 0 || y < 0 || x >= xres || y >= yres)
 		return;
+	uint8_t *buf = backbuf ? backbuf : fbp;
 	long off = (long)y * line_length + (long)x * (bpp / 8);
 	if (bpp == 32) {
-		*(uint32_t *)(fbp + off) = color;
+		*(uint32_t *)(buf + off) = color;
 	} else if (bpp == 16) {
 		uint8_t r = (color >> 16) & 0xff, g = (color >> 8) & 0xff, b = color & 0xff;
 		uint16_t c565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-		*(uint16_t *)(fbp + off) = c565;
+		*(uint16_t *)(buf + off) = c565;
 	} else if (bpp == 24) {
-		fbp[off] = color & 0xff;
-		fbp[off + 1] = (color >> 8) & 0xff;
-		fbp[off + 2] = (color >> 16) & 0xff;
+		buf[off] = color & 0xff;
+		buf[off + 1] = (color >> 8) & 0xff;
+		buf[off + 2] = (color >> 16) & 0xff;
 	}
 }
 
@@ -120,6 +131,25 @@ static void fill_rect(int x, int y, int w, int h, uint32_t color)
 	for (int j = 0; j < h; j++)
 		for (int i = 0; i < w; i++)
 			put_pixel(x + i, y + j, color);
+}
+
+static void draw_cursor(int x, int y)
+{
+	int size = 12;
+	put_pixel(x, y, 0xffffff);
+	put_pixel(x + 1, y, 0xffffff);
+	put_pixel(x, y + 1, 0xffffff);
+	put_pixel(x + 1, y + 1, 0xffffff);
+	for (int i = 2; i < size; i++) {
+		put_pixel(x, y + i, 0xffffff);
+		put_pixel(x + i, y, 0xffffff);
+	}
+	put_pixel(x + 1, y + 2, 0x000000);
+	put_pixel(x + 2, y + 1, 0x000000);
+	for (int i = 2; i < size - 1; i++) {
+		put_pixel(x + 1, y + i, 0x000000);
+		put_pixel(x + i, y + 1, 0x000000);
+	}
 }
 
 static void blit_char(int x, int y, unsigned char c, uint32_t fg)
@@ -201,12 +231,6 @@ static int icon_at(int px, int py)
 			return i;
 	}
 	return -1;
-}
-
-static void draw_cursor(int x, int y)
-{
-	fill_rect(x - 1, y - 6, 2, 12, 0xffffff);
-	fill_rect(x - 6, y - 1, 12, 2, 0xffffff);
 }
 
 /* ---- character-grid terminal model, shared by live terminals and
@@ -653,6 +677,39 @@ static void draw_taskbar(void)
 		draw_text_clip(bx + 6, yres - TASK_H + 4 + (TASK_H - 8 - font_h) / 2, wins[i].title, 0xffffff, bw - 12);
 		bx += bw + 6;
 	}
+	char timebuf[16];
+	time_t t = time(NULL);
+	struct tm *tm = localtime(&t);
+	snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
+	draw_text_clip(xres - 80, yres - TASK_H + 4 + (TASK_H - 8 - font_h) / 2, timebuf, 0xffffff, 70);
+}
+
+static void cycle_window_focus(void)
+{
+	if (zcount == 0)
+		return;
+	int next = -1;
+	for (int i = 0; i < zcount; i++) {
+		if (zorder[i] == focused) {
+			next = zorder[(i + 1) % zcount];
+			break;
+		}
+	}
+	if (next == -1 && zcount > 0)
+		next = zorder[0];
+	if (next >= 0 && wins[next].used) {
+		if (wins[next].minimized) {
+			wins[next].minimized = 0;
+			if (wins[next].maximized) {
+				wins[next].x = wins[next].rx;
+				wins[next].y = wins[next].ry;
+				wins[next].w = wins[next].rw;
+				wins[next].h = wins[next].rh;
+				wins[next].maximized = 0;
+			}
+		}
+		raise_window(next);
+	}
 }
 
 static void redraw_all(void)
@@ -666,6 +723,8 @@ static void redraw_all(void)
 	}
 	draw_taskbar();
 	draw_cursor(mx, my);
+	if (backbuf)
+		memcpy(fbp, backbuf, (size_t)line_length * yres);
 }
 
 static void clamp_window(struct window *w)
@@ -754,7 +813,52 @@ static void do_hit_test(int x, int y)
 	}
 }
 
-static void handle_mouse_packet(unsigned char *pkt)
+/* Shared pointer handler: nx,ny = new absolute cursor position, left = button.
+ * Works for both absolute (evdev tablet) and relative (PS/2 mouse) sources. */
+static int process_pointer(int nx, int ny, int left)
+{
+	if (nx < 0) nx = 0;
+	if (ny < 0) ny = 0;
+	if (nx >= xres) nx = xres - 1;
+	if (ny >= yres) ny = yres - 1;
+	int dx = nx - mx, dy = ny - my;
+	mx = nx;
+	my = ny;
+
+	int changed = (dx || dy);
+	if (left && drag_mode == 1 && drag_win >= 0 && wins[drag_win].used) {
+		wins[drag_win].x += dx;
+		wins[drag_win].y += dy;
+		clamp_window(&wins[drag_win]);
+		changed = 1;
+	} else if (left && drag_mode == 2 && drag_win >= 0 && wins[drag_win].used) {
+		wins[drag_win].w += dx;
+		wins[drag_win].h += dy;
+		if (wins[drag_win].w < WIN_MINW) wins[drag_win].w = WIN_MINW;
+		if (wins[drag_win].h < WIN_MINH) wins[drag_win].h = WIN_MINH;
+		resize_notify(&wins[drag_win]);
+		changed = 1;
+	} else if (left && !prev_left) {
+		do_hit_test(mx, my);
+		changed = 1;
+	}
+	if (!left && prev_left) {
+		if (drag_mode == 2 && drag_win >= 0 && wins[drag_win].used)
+			resize_notify(&wins[drag_win]);
+		changed = 1;
+	}
+	if (left != prev_left)
+		changed = 1;
+	if (!left) {
+		drag_mode = 0;
+		drag_win = -1;
+	}
+	prev_left = left;
+	return changed;
+}
+
+/* PS/2 relative fallback (real mouse / touchpad, no absolute device). */
+static int handle_mouse_packet(unsigned char *pkt)
 {
 	int left = pkt[0] & 0x1;
 	int dx = pkt[1];
@@ -762,33 +866,105 @@ static void handle_mouse_packet(unsigned char *pkt)
 	if (pkt[0] & 0x10) dx -= 256;
 	if (pkt[0] & 0x20) dy -= 256;
 	dy = -dy;
-	mx += dx;
-	my += dy;
-	if (mx < 0) mx = 0;
-	if (my < 0) my = 0;
-	if (mx >= xres) mx = xres - 1;
-	if (my >= yres) my = yres - 1;
+	return process_pointer(mx + dx, my + dy, left);
+}
 
-	if (left && drag_mode == 1 && drag_win >= 0 && wins[drag_win].used) {
-		wins[drag_win].x += dx;
-		wins[drag_win].y += dy;
-		clamp_window(&wins[drag_win]);
-	} else if (left && drag_mode == 2 && drag_win >= 0 && wins[drag_win].used) {
-		wins[drag_win].w += dx;
-		wins[drag_win].h += dy;
-		if (wins[drag_win].w < WIN_MINW) wins[drag_win].w = WIN_MINW;
-		if (wins[drag_win].h < WIN_MINH) wins[drag_win].h = WIN_MINH;
-		resize_notify(&wins[drag_win]);
-	} else if (left && !prev_left) {
-		do_hit_test(mx, my);
+/* Read all pending events from the absolute pointer; map to screen coords. */
+static int read_abs_pointer(void)
+{
+	struct input_event ev;
+	int changed = 0;
+	while (read(absptr_fd, &ev, sizeof(ev)) == (int)sizeof(ev)) {
+		if (ev.type == EV_ABS) {
+			if (ev.code == ABS_X) abs_curx = ev.value;
+			else if (ev.code == ABS_Y) abs_cury = ev.value;
+		} else if (ev.type == EV_KEY) {
+			if (ev.code == BTN_LEFT || ev.code == BTN_TOUCH)
+				abs_btn = ev.value ? 1 : 0;
+		} else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+			int rx = abs_maxx - abs_minx; if (rx <= 0) rx = 1;
+			int ry = abs_maxy - abs_miny; if (ry <= 0) ry = 1;
+			int nx = (int)((long)(abs_curx - abs_minx) * (xres - 1) / rx);
+			int ny = (int)((long)(abs_cury - abs_miny) * (yres - 1) / ry);
+			if (process_pointer(nx, ny, abs_btn))
+				changed = 1;
+		}
 	}
-	if (!left) {
-		if (drag_mode == 2 && drag_win >= 0 && wins[drag_win].used)
-			resize_notify(&wins[drag_win]);
-		drag_mode = 0;
-		drag_win = -1;
+	return changed;
+}
+
+/* Read evdev keyboard just to catch Alt+Tab (keymap-independent). Text input
+ * still flows through stdin. */
+static int read_kbd_evdev(void)
+{
+	struct input_event ev;
+	int changed = 0;
+	while (read(kbd_evdev_fd, &ev, sizeof(ev)) == (int)sizeof(ev)) {
+		if (ev.type != EV_KEY)
+			continue;
+		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+			alt_held = (ev.value != 0);
+		} else if (ev.code == KEY_TAB && ev.value == 1 && alt_held) {
+			cycle_window_focus();
+			changed = 1;
+		}
 	}
-	prev_left = left;
+	return changed;
+}
+
+static void scan_input_devices(void)
+{
+	for (int i = 0; i < 32; i++) {
+		char path[32];
+		snprintf(path, sizeof(path), "/dev/input/event%d", i);
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+		unsigned char evbit[(EV_MAX + 7) / 8] = {0};
+		unsigned char absbit[(ABS_MAX + 7) / 8] = {0};
+		unsigned char keybit[(KEY_MAX + 7) / 8] = {0};
+		ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
+		int is_abs = 0, is_kbd = 0;
+		if (test_bit(EV_ABS, evbit)) {
+			ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbit)), absbit);
+			if (test_bit(ABS_X, absbit) && test_bit(ABS_Y, absbit))
+				is_abs = 1;
+		}
+		if (test_bit(EV_KEY, evbit)) {
+			ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
+			if (test_bit(KEY_A, keybit) && test_bit(KEY_ENTER, keybit))
+				is_kbd = 1;
+		}
+		if (is_abs && absptr_fd < 0) {
+			absptr_fd = fd;
+			struct input_absinfo ai;
+			if (ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0) { abs_minx = ai.minimum; abs_maxx = ai.maximum; }
+			if (ioctl(fd, EVIOCGABS(ABS_Y), &ai) == 0) { abs_miny = ai.minimum; abs_maxy = ai.maximum; }
+			DBG("[input] abs pointer %s x[%d..%d] y[%d..%d]\n", path, abs_minx, abs_maxx, abs_miny, abs_maxy);
+			continue;
+		}
+		if (is_kbd && kbd_evdev_fd < 0) {
+			kbd_evdev_fd = fd;
+			DBG("[input] keyboard %s\n", path);
+			continue;
+		}
+		close(fd);
+	}
+}
+
+/* USB tablets enumerate a few hundred ms after boot, often after we first run.
+ * Retry briefly until an absolute pointer appears, then give up and let the
+ * caller fall back to the relative PS/2 mouse.
+ * ponytail: fixed ~2s cap; only real hardware with no tablet ever waits the
+ * full time. Switch to a udev/inotify watch if that delay matters. */
+static void open_input_devices(void)
+{
+	for (int attempt = 0; attempt < 20; attempt++) {
+		scan_input_devices();
+		if (absptr_fd >= 0)
+			return;
+		usleep(100000);
+	}
 }
 
 static void setup_raw_stdin(void)
@@ -829,6 +1005,7 @@ int main(void)
 		perror("mmap fb");
 		return 1;
 	}
+	backbuf = malloc(screensize);  /* NULL is fine: put_pixel falls back to fbp */
 
 	dbg = fopen("/dev/ttyS0", "w");
 	if (dbg)
@@ -856,7 +1033,10 @@ int main(void)
 	DBG("[fbdesktop] xres=%d yres=%d bpp=%d have_font=%d font_w=%d font_h=%d\n",
 		xres, yres, bpp, have_font, font_w, font_h);
 
-	int mousefd = open("/dev/input/mice", O_RDONLY);
+	open_input_devices();
+	/* Only fall back to relative PS/2 mouse when no absolute tablet exists,
+	 * otherwise mousedev would relay the tablet as relative and cause drift. */
+	int mousefd = (absptr_fd < 0) ? open("/dev/input/mice", O_RDONLY) : -1;
 
 	mx = xres / 2;
 	my = yres / 2;
@@ -867,12 +1047,24 @@ int main(void)
 	redraw_all();
 
 	for (;;) {
-		struct pollfd fds[2 + MAX_WIN];
+		struct pollfd fds[4 + MAX_WIN];
 		int n = 0;
-		int mouse_i = -1, kbd_i;
+		int mouse_i = -1, abs_i = -1, kev_i = -1, kbd_i;
 		if (mousefd >= 0) {
 			mouse_i = n;
 			fds[n].fd = mousefd;
+			fds[n].events = POLLIN;
+			n++;
+		}
+		if (absptr_fd >= 0) {
+			abs_i = n;
+			fds[n].fd = absptr_fd;
+			fds[n].events = POLLIN;
+			n++;
+		}
+		if (kbd_evdev_fd >= 0) {
+			kev_i = n;
+			fds[n].fd = kbd_evdev_fd;
 			fds[n].events = POLLIN;
 			n++;
 		}
@@ -903,14 +1095,25 @@ int main(void)
 		if (mouse_i >= 0 && (fds[mouse_i].revents & POLLIN)) {
 			unsigned char pkt[3];
 			if (read(mousefd, pkt, 3) == 3) {
-				handle_mouse_packet(pkt);
-				need_redraw = 1;
+				if (handle_mouse_packet(pkt))
+					need_redraw = 1;
 			}
+		}
+		if (abs_i >= 0 && (fds[abs_i].revents & POLLIN)) {
+			if (read_abs_pointer())
+				need_redraw = 1;
+		}
+		if (kev_i >= 0 && (fds[kev_i].revents & POLLIN)) {
+			if (read_kbd_evdev())
+				need_redraw = 1;
 		}
 		if (fds[kbd_i].revents & POLLIN) {
 			char buf[64];
 			int r = read(STDIN_FILENO, buf, sizeof(buf));
-			if (r > 0 && focused >= 0 && wins[focused].used && wins[focused].type == WIN_TERM)
+			/* Swallow keystrokes while Alt is held so Alt+Tab's ESC/Tab bytes
+			 * don't leak into the focused shell. */
+			if (r > 0 && !alt_held && focused >= 0 && wins[focused].used &&
+			    wins[focused].type == WIN_TERM)
 				write(wins[focused].pty_fd, buf, r);
 		}
 		for (int i = 0; i < MAX_WIN; i++) {
