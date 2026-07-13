@@ -16,8 +16,10 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/kd.h>
@@ -25,11 +27,12 @@
 
 #define test_bit(nr, arr) (((arr)[(nr) / 8] >> ((nr) % 8)) & 1)
 
-#define ICON_W 140
-#define ICON_H 90
-#define ICON_GAP 30
-#define TITLE_H 24
-#define TASK_H 32
+#define ICON_W 104        /* cell width  */
+#define ICON_H 116        /* cell height: tile + label */
+#define ICON_GAP 18
+#define TILE 72           /* the colored rounded square */
+#define TITLE_H 30
+#define TASK_H 38
 #define MAX_WIN 8
 #define WIN_MINW 240
 #define WIN_MINH 150
@@ -38,26 +41,60 @@
 #define COL_FG_DEFAULT 0xcdd6f4
 #define COL_BG_DEFAULT 0x1e1e2e
 
-enum wintype { WIN_TERM, WIN_OUTPUT };
+enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES };
+
+enum glyph {
+	G_GEAR, G_LIST, G_DISK, G_CHIP, G_DOC, G_FOLDER, G_TERM, G_REFRESH, G_POWER
+};
 
 struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 0=open output window, 1=reboot, 2=poweroff, 3=spawn terminal */
+	int action; /* 0=output window, 1=reboot, 2=poweroff, 3=terminal, 4=file manager */
+	int glyph;
+	int x, y;   /* free position on the desktop -- icons are draggable */
 };
 
 static struct icon icons[] = {
-	{"SYSTEM",    "uname -a; echo; cat /proc/uptime; echo; cat /proc/version", 0x3b82f6, 0},
-	{"PROCESSES", "ps aux", 0x22c55e, 0},
-	{"DISK",      "df -h", 0xeab308, 0},
-	{"MEMORY",    "free -m", 0xf97316, 0},
-	{"DMESG",     "dmesg | tail -40", 0x14b8a6, 0},
-	{"TERMINAL",  NULL, 0x9333ea, 3},
-	{"REBOOT",    NULL, 0xef4444, 1},
-	{"POWER OFF", NULL, 0xf43f5e, 2},
+	{"SYSTEM",    "uname -a; echo; cat /proc/uptime; echo; cat /proc/version", 0x3b82f6, 0, G_GEAR},
+	{"PROCESSES", "ps aux", 0x22c55e, 0, G_LIST},
+	{"DISK",      "df -h", 0xeab308, 0, G_DISK},
+	{"MEMORY",    "free -m", 0xf97316, 0, G_CHIP},
+	{"DMESG",     "dmesg | tail -40", 0x14b8a6, 0, G_DOC},
+	{"FILES",     NULL, 0x06b6d4, 4, G_FOLDER},
+	{"TERMINAL",  NULL, 0x9333ea, 3, G_TERM},
+	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
+	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
 };
 #define NUM_ICONS (int)(sizeof(icons)/sizeof(icons[0]))
+
+/* icon drag state: press selects, movement past a threshold turns it into a
+ * drag, release without movement launches. */
+static int icon_press = -1;
+static int icon_dragged;
+static int icon_grab_dx, icon_grab_dy;
+
+/* File manager state, allocated only for WIN_FILES windows. */
+#define FM_MAXENT 512
+#define FM_NAMELEN 96
+#define FM_PATHLEN 512
+/* cwd + '/' + name + NUL: any child path is guaranteed to fit */
+#define FM_FULLLEN (FM_PATHLEN + FM_NAMELEN + 2)
+
+struct fent {
+	char name[FM_NAMELEN];
+	int isdir;
+	int isreg;
+	long size;
+};
+
+struct fmstate {
+	char cwd[FM_PATHLEN];
+	struct fent ents[FM_MAXENT];
+	int count;
+	int scroll;
+};
 
 struct window {
 	int used;
@@ -65,10 +102,11 @@ struct window {
 	int x, y, w, h;
 	int rx, ry, rw, rh; /* saved geometry for un-maximize */
 	int minimized, maximized;
-	char title[32];
+	char title[FM_PATHLEN]; /* holds a full cwd for file windows; drawn clipped */
 
 	int pty_fd;
 	pid_t pid;
+	struct fmstate *fm; /* WIN_FILES only */
 
 	int cols, rows;
 	unsigned char gch[GRID_MAXROWS][GRID_MAXCOLS];
@@ -167,6 +205,95 @@ static void blit_char(int x, int y, unsigned char c, uint32_t fg)
 	}
 }
 
+/* ---- shape primitives (integer-only, no libm) ---- */
+
+/* Blend two colors: t=0 -> a, t=255 -> b. */
+static uint32_t mix(uint32_t a, uint32_t b, int t)
+{
+	int ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+	int br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+	int r = ar + (br - ar) * t / 255;
+	int g = ag + (bg - ag) * t / 255;
+	int bl = ab + (bb - ab) * t / 255;
+	return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
+}
+
+/* Rounded rect with a vertical gradient (top==bot gives a flat fill). */
+static void fill_round_rect_grad(int x, int y, int w, int h, int r,
+				 uint32_t top, uint32_t bot)
+{
+	if (r * 2 > w) r = w / 2;
+	if (r * 2 > h) r = h / 2;
+	if (r < 0) r = 0;
+	for (int j = 0; j < h; j++) {
+		uint32_t col = (top == bot) ? top
+			: mix(top, bot, h > 1 ? j * 255 / (h - 1) : 0);
+		for (int i = 0; i < w; i++) {
+			int cx = -1, cy = -1;
+			if (i < r && j < r) { cx = r; cy = r; }
+			else if (i >= w - r && j < r) { cx = w - r - 1; cy = r; }
+			else if (i < r && j >= h - r) { cx = r; cy = h - r - 1; }
+			else if (i >= w - r && j >= h - r) { cx = w - r - 1; cy = h - r - 1; }
+			if (cx >= 0) {
+				int dx = i - cx, dy = j - cy;
+				if (dx * dx + dy * dy > r * r)
+					continue;
+			}
+			put_pixel(x + i, y + j, col);
+		}
+	}
+}
+
+static void fill_round_rect(int x, int y, int w, int h, int r, uint32_t col)
+{
+	fill_round_rect_grad(x, y, w, h, r, col, col);
+}
+
+static void fill_circle(int cx, int cy, int r, uint32_t col)
+{
+	for (int j = -r; j <= r; j++)
+		for (int i = -r; i <= r; i++)
+			if (i * i + j * j <= r * r)
+				put_pixel(cx + i, cy + j, col);
+}
+
+/* Annulus: outer radius r, thickness t. */
+static void fill_ring(int cx, int cy, int r, int t, uint32_t col)
+{
+	int inner = r - t;
+	if (inner < 0) inner = 0;
+	for (int j = -r; j <= r; j++)
+		for (int i = -r; i <= r; i++) {
+			int d = i * i + j * j;
+			if (d <= r * r && d >= inner * inner)
+				put_pixel(cx + i, cy + j, col);
+		}
+}
+
+/* Triangle with its tip at distance s from (cx,cy). dir: 0=up 1=down 2=left 3=right */
+static void fill_triangle(int cx, int cy, int s, int dir, uint32_t col)
+{
+	for (int j = 0; j <= s; j++) {
+		for (int i = -j; i <= j; i++) {
+			int px, py;
+			if (dir == 0)      { px = cx + i;     py = cy - s + j; }
+			else if (dir == 1) { px = cx + i;     py = cy + s - j; }
+			else if (dir == 2) { px = cx - s + j; py = cy + i;     }
+			else               { px = cx + s - j; py = cy + i;     }
+			put_pixel(px, py, col);
+		}
+	}
+}
+
+static void fill_vgradient(int x, int y, int w, int h, uint32_t top, uint32_t bot)
+{
+	for (int j = 0; j < h; j++) {
+		uint32_t c = mix(top, bot, h > 1 ? j * 255 / (h - 1) : 0);
+		for (int i = 0; i < w; i++)
+			put_pixel(x + i, y + j, c);
+	}
+}
+
 static void draw_text(int x, int y, const char *s, uint32_t fg)
 {
 	int cx = x, cy = y;
@@ -201,33 +328,136 @@ static void draw_text_clip(int x, int y, const char *s, uint32_t fg, int maxw)
 	draw_text(x, y, buf, fg);
 }
 
-static int icon_grid_xy(int i, int *ox, int *oy)
+/* Vector-style glyphs, drawn from primitives and centered on (cx,cy).
+ * `fg` is the ink, `hole` is used to punch cutouts back out of the tile. */
+static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
+{
+	switch (g) {
+	case G_GEAR:
+		/* four axis teeth + four diagonal teeth, then the hub */
+		fill_round_rect(cx - 5,  cy - 23, 10, 12, 2, fg);
+		fill_round_rect(cx - 5,  cy + 11, 10, 12, 2, fg);
+		fill_round_rect(cx - 23, cy - 5,  12, 10, 2, fg);
+		fill_round_rect(cx + 11, cy - 5,  12, 10, 2, fg);
+		fill_round_rect(cx - 18, cy - 18, 11, 11, 2, fg);
+		fill_round_rect(cx + 7,  cy - 18, 11, 11, 2, fg);
+		fill_round_rect(cx - 18, cy + 7,  11, 11, 2, fg);
+		fill_round_rect(cx + 7,  cy + 7,  11, 11, 2, fg);
+		fill_circle(cx, cy, 16, fg);
+		fill_circle(cx, cy, 6, hole);
+		break;
+	case G_LIST:
+		for (int i = 0; i < 3; i++) {
+			int ry = cy - 14 + i * 12;
+			static const int wds[3] = {26, 20, 24};
+			fill_circle(cx - 16, ry + 3, 3, fg);
+			fill_round_rect(cx - 8, ry, wds[i], 6, 3, fg);
+		}
+		break;
+	case G_DISK:
+		for (int i = 0; i < 3; i++) {
+			int ry = cy - 19 + i * 13;
+			fill_round_rect(cx - 19, ry, 38, 12, 6, fg);
+			fill_circle(cx + 12, ry + 6, 2, hole);
+		}
+		break;
+	case G_CHIP:
+		/* a RAM stick, not a gear -- keeps it distinct from SYSTEM */
+		fill_round_rect(cx - 22, cy - 13, 44, 25, 3, fg);
+		for (int i = 0; i < 3; i++)  /* the chips on the module */
+			fill_rect(cx - 17 + i * 12, cy - 7, 9, 12, hole);
+		fill_rect(cx - 3, cy + 8, 6, 4, hole);      /* keying notch */
+		for (int i = 0; i < 8; i++)                 /* contact pins */
+			fill_rect(cx - 21 + i * 6, cy + 12, 3, 6, fg);
+		break;
+	case G_DOC:
+		fill_round_rect(cx - 15, cy - 20, 30, 40, 3, fg);
+		fill_triangle(cx + 11, cy - 16, 6, 3, hole); /* folded corner */
+		fill_rect(cx - 9, cy - 11, 18, 3, hole);
+		fill_rect(cx - 9, cy - 4,  18, 3, hole);
+		fill_rect(cx - 9, cy + 3,  12, 3, hole);
+		fill_rect(cx - 9, cy + 10, 15, 3, hole);
+		break;
+	case G_FOLDER:
+		fill_round_rect(cx - 19, cy - 17, 17, 9, 3, fg);
+		fill_round_rect(cx - 19, cy - 12, 38, 27, 4, fg);
+		fill_round_rect(cx - 16, cy - 6, 32, 3, 1, mix(fg, hole, 120));
+		break;
+	case G_TERM:
+		fill_round_rect(cx - 20, cy - 16, 40, 32, 4, fg);
+		fill_round_rect(cx - 16, cy - 8, 32, 20, 2, hole);
+		fill_circle(cx - 15, cy - 12, 2, hole);
+		fill_circle(cx - 9,  cy - 12, 2, hole);
+		fill_circle(cx - 3,  cy - 12, 2, hole);
+		/* prompt chevron + cursor */
+		fill_rect(cx - 12, cy - 2, 3, 3, fg);
+		fill_rect(cx - 9,  cy + 1, 3, 3, fg);
+		fill_rect(cx - 12, cy + 4, 3, 3, fg);
+		fill_rect(cx - 3,  cy + 4, 9, 3, fg);
+		break;
+	case G_REFRESH:
+		fill_ring(cx, cy + 2, 16, 5, fg);
+		fill_rect(cx, cy - 22, 22, 13, hole);       /* open the top-right arc */
+		fill_triangle(cx + 4, cy - 13, 10, 3, fg);  /* arrow head on the opening */
+		break;
+	case G_POWER:
+		fill_ring(cx, cy + 3, 16, 6, fg);
+		fill_rect(cx - 5, cy - 16, 10, 12, hole);  /* gap at the top */
+		fill_round_rect(cx - 2, cy - 18, 5, 18, 2, fg);
+		break;
+	default:
+		break;
+	}
+}
+
+static void init_icon_positions(void)
 {
 	int cols = (xres - ICON_GAP) / (ICON_W + ICON_GAP);
 	if (cols < 1)
 		cols = 1;
-	int col = i % cols, row = i / cols;
-	*ox = ICON_GAP + col * (ICON_W + ICON_GAP);
-	*oy = ICON_GAP + row * (ICON_H + ICON_GAP);
-	return cols;
+	for (int i = 0; i < NUM_ICONS; i++) {
+		icons[i].x = ICON_GAP + (i % cols) * (ICON_W + ICON_GAP);
+		icons[i].y = ICON_GAP + (i / cols) * (ICON_H + ICON_GAP);
+	}
+}
+
+static void clamp_icon(struct icon *ic)
+{
+	if (ic->x < 0) ic->x = 0;
+	if (ic->y < 0) ic->y = 0;
+	if (ic->x > xres - ICON_W) ic->x = xres - ICON_W;
+	if (ic->y > yres - TASK_H - ICON_H) ic->y = yres - TASK_H - ICON_H;
 }
 
 static void draw_icons(void)
 {
 	for (int i = 0; i < NUM_ICONS; i++) {
-		int x, y;
-		icon_grid_xy(i, &x, &y);
-		fill_rect(x, y, ICON_W, ICON_H, icons[i].color);
-		draw_text(x + 8, y + ICON_H / 2 - font_h / 2, icons[i].label, 0xffffff);
+		struct icon *ic = &icons[i];
+		int lifted = (icon_press == i && icon_dragged);
+		int tx = ic->x + (ICON_W - TILE) / 2;
+		int ty = ic->y;
+		uint32_t c = ic->color;
+
+		/* drop shadow (deeper while the icon is lifted by a drag) */
+		fill_round_rect(tx + 2, ty + (lifted ? 7 : 4), TILE, TILE, 18, 0x0c0c14);
+		fill_round_rect_grad(tx, ty, TILE, TILE, 18,
+				     mix(c, 0xffffff, lifted ? 75 : 40),
+				     mix(c, 0x000000, 55));
+		draw_glyph(ic->glyph, tx + TILE / 2, ty + TILE / 2,
+			   0xffffff, mix(c, 0x000000, 78));
+
+		int len = strlen(ic->label);
+		int lx = ic->x + (ICON_W - len * font_w) / 2;
+		draw_text(lx, ty + TILE + 9, ic->label, 0xdfe4f2);
 	}
 }
 
 static int icon_at(int px, int py)
 {
-	for (int i = 0; i < NUM_ICONS; i++) {
-		int x, y;
-		icon_grid_xy(i, &x, &y);
-		if (px >= x && px < x + ICON_W && py >= y && py < y + ICON_H)
+	for (int i = NUM_ICONS - 1; i >= 0; i--) {
+		struct icon *ic = &icons[i];
+		if (px >= ic->x && px < ic->x + ICON_W &&
+		    py >= ic->y && py < ic->y + ICON_H)
 			return i;
 	}
 	return -1;
@@ -251,9 +481,13 @@ static void update_grid_dims(struct window *w)
 	if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
 }
 
+static void fm_render(struct window *w);
+
 static void resize_notify(struct window *w)
 {
 	update_grid_dims(w);
+	if (w->type == WIN_FILES && w->fm)
+		fm_render(w);
 	if (w->type == WIN_TERM && w->pty_fd >= 0) {
 		struct winsize ws;
 		memset(&ws, 0, sizeof(ws));
@@ -467,6 +701,10 @@ static void close_window(int i)
 			waitpid(wins[i].pid, NULL, 0);
 		}
 	}
+	if (wins[i].fm) {
+		free(wins[i].fm);
+		wins[i].fm = NULL;
+	}
 	wins[i].used = 0;
 	for (int zi = 0; zi < zcount; zi++) {
 		if (zorder[zi] == i) {
@@ -617,20 +855,236 @@ static int spawn_output_window(const char *title, const char *cmd)
 	return slot;
 }
 
+/* ---- file manager ---- */
+
+static void fm_puts(struct window *w, int row, int col, const char *s, uint32_t fg)
+{
+	for (int i = 0; s[i] && col + i < w->cols; i++) {
+		w->gch[row][col + i] = (unsigned char)s[i];
+		w->gfg[row][col + i] = fg;
+		w->gbg[row][col + i] = COL_BG_DEFAULT;
+	}
+}
+
+static void fm_render(struct window *w)
+{
+	struct fmstate *fm = w->fm;
+	int maxscroll = fm->count - w->rows;
+	if (maxscroll < 0) maxscroll = 0;
+	if (fm->scroll > maxscroll) fm->scroll = maxscroll;
+	if (fm->scroll < 0) fm->scroll = 0;
+
+	for (int r = 0; r < w->rows; r++)
+		clear_row_range(w, r, 0, w->cols - 1);
+
+	for (int r = 0; r < w->rows; r++) {
+		int i = fm->scroll + r;
+		if (i >= fm->count)
+			break;
+		struct fent *e = &fm->ents[i];
+		char line[FM_NAMELEN + 16];
+		snprintf(line, sizeof(line), "%s %s", e->isdir ? "[DIR]" : "     ", e->name);
+		fm_puts(w, r, 0, line, e->isdir ? 0x89b4fa : COL_FG_DEFAULT);
+		if (e->isreg) {
+			char sz[24];
+			snprintf(sz, sizeof(sz), "%ld", e->size);
+			int col = w->cols - (int)strlen(sz) - 1;
+			if (col > (int)strlen(line) + 1)
+				fm_puts(w, r, col, sz, 0x6c7086);
+		}
+	}
+}
+
+/* Directories first, then alphabetical. */
+static int fent_cmp(const void *a, const void *b)
+{
+	const struct fent *x = a, *y = b;
+	if (x->isdir != y->isdir)
+		return y->isdir - x->isdir;
+	return strcmp(x->name, y->name);
+}
+
+static void fm_path(struct fmstate *fm, const char *name, char *out, size_t n)
+{
+	snprintf(out, n, "%s%s%s", fm->cwd, strcmp(fm->cwd, "/") ? "/" : "", name);
+}
+
+static void fm_load(struct window *w)
+{
+	struct fmstate *fm = w->fm;
+	fm->count = 0;
+	fm->scroll = 0;
+
+	if (strcmp(fm->cwd, "/") != 0) {
+		snprintf(fm->ents[0].name, FM_NAMELEN, "..");
+		fm->ents[0].isdir = 1;
+		fm->ents[0].isreg = 0;
+		fm->ents[0].size = 0;
+		fm->count = 1;
+	}
+
+	DIR *d = opendir(fm->cwd);
+	if (d) {
+		int start = fm->count;
+		struct dirent *de;
+		while ((de = readdir(d)) && fm->count < FM_MAXENT) {
+			if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+				continue;
+			struct fent *e = &fm->ents[fm->count];
+			/* A name too long to store is a name we could never open again. */
+			if (strlen(de->d_name) >= FM_NAMELEN)
+				continue;
+			snprintf(e->name, FM_NAMELEN, "%s", de->d_name);
+			char path[FM_FULLLEN];
+			fm_path(fm, e->name, path, sizeof(path));
+			struct stat st;
+			if (stat(path, &st) == 0) {
+				e->isdir = S_ISDIR(st.st_mode);
+				e->isreg = S_ISREG(st.st_mode);
+				e->size = (long)st.st_size;
+			} else {
+				e->isdir = e->isreg = 0;
+				e->size = 0;
+			}
+			fm->count++;
+		}
+		closedir(d);
+		/* sort everything after the ".." entry, which must stay first */
+		qsort(fm->ents + start, fm->count - start, sizeof(struct fent), fent_cmp);
+	}
+	snprintf(w->title, sizeof(w->title), "%s", fm->cwd);
+	fm_render(w);
+}
+
+static void fm_click(struct window *w, int y)
+{
+	struct fmstate *fm = w->fm;
+	int row = (y - (w->y + TITLE_H)) / font_h;
+	if (row < 0 || row >= w->rows)
+		return;
+	int i = fm->scroll + row;
+	if (i < 0 || i >= fm->count)
+		return;
+	struct fent *e = &fm->ents[i];
+
+	if (!strcmp(e->name, "..")) {
+		char *slash = strrchr(fm->cwd, '/');
+		if (slash && slash != fm->cwd)
+			*slash = 0;
+		else
+			strcpy(fm->cwd, "/");
+		fm_load(w);
+		return;
+	}
+
+	char path[FM_FULLLEN];
+	fm_path(fm, e->name, path, sizeof(path));
+
+	if (e->isdir) {
+		/* Refuse rather than truncate: a truncated cwd is a wrong directory. */
+		if (strlen(path) >= sizeof(fm->cwd))
+			return;
+		memcpy(fm->cwd, path, strlen(path) + 1);
+		fm_load(w);
+	} else if (e->isreg) {
+		/* Regular files only: cat on a fifo or char device would block forever. */
+		if (strchr(path, '\''))
+			return; /* refuse to build a shell command we can't quote safely */
+		char cmd[FM_FULLLEN + 16];
+		snprintf(cmd, sizeof(cmd), "cat '%s'", path);
+		spawn_output_window(e->name, cmd);
+	}
+}
+
+/* Arrow / PageUp / PageDown scroll the listing. */
+static int fm_keys(struct window *w, const char *buf, int n)
+{
+	struct fmstate *fm = w->fm;
+	int changed = 0;
+	for (int i = 0; i + 2 < n; i++) {
+		if (buf[i] != 0x1b || buf[i + 1] != '[')
+			continue;
+		int delta = 0;
+		switch (buf[i + 2]) {
+		case 'A': delta = -1; break;
+		case 'B': delta = 1; break;
+		case '5': delta = -(w->rows - 1); break;
+		case '6': delta = w->rows - 1; break;
+		default: break;
+		}
+		if (delta) {
+			fm->scroll += delta;
+			fm_render(w); /* clamps scroll */
+			changed = 1;
+		}
+		i += 2;
+	}
+	return changed;
+}
+
+static int spawn_file_window(void)
+{
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+	struct fmstate *fm = calloc(1, sizeof(struct fmstate));
+	if (!fm)
+		return -1;
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_FILES;
+	wins[slot].pty_fd = -1;
+	wins[slot].fm = fm;
+	wins[slot].x = 240 + slot * 24;
+	wins[slot].y = 100 + slot * 24;
+	wins[slot].w = 620;
+	wins[slot].h = 440;
+	wins[slot].attr_fg = COL_FG_DEFAULT;
+	wins[slot].attr_bg = COL_BG_DEFAULT;
+	snprintf(fm->cwd, sizeof(fm->cwd), "/");
+	update_grid_dims(&wins[slot]);
+	fm_load(&wins[slot]);
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+/* Small colored dot per window type, drawn in the titlebar. */
+static uint32_t win_accent(const struct window *w)
+{
+	if (w->type == WIN_TERM)  return 0x9333ea;
+	if (w->type == WIN_FILES) return 0x06b6d4;
+	return 0x3b82f6;
+}
+
 static void draw_window(struct window *w)
 {
-	fill_rect(w->x, w->y, w->w, TITLE_H, 0x313244);
-	draw_text_clip(w->x + 6, w->y + 4, w->title, 0xffffff, w->w - 80);
+	int i = (int)(w - wins);
+	int act = (i == focused);
 
-	int bx = w->x + w->w - 24;
-	fill_rect(bx, w->y, 24, TITLE_H, 0xef4444);
-	draw_text(bx + 8, w->y + 4, "X", 0xffffff);
-	bx -= 24;
-	fill_rect(bx, w->y, 24, TITLE_H, 0x45475a);
-	draw_text(bx + 8, w->y + 4, "^", 0xffffff);
-	bx -= 24;
-	fill_rect(bx, w->y, 24, TITLE_H, 0x45475a);
-	draw_text(bx + 8, w->y + 4, "_", 0xffffff);
+	/* drop shadow */
+	fill_round_rect(w->x + 5, w->y + 6, w->w, w->h, 9, 0x0a0a11);
+	/* frame: a 1px outline that brightens when focused */
+	fill_round_rect(w->x - 1, w->y - 1, w->w + 2, w->h + 2, 9,
+			act ? 0x6c7086 : 0x2a2a38);
+
+	/* titlebar: rounded on top, squared where it meets the content */
+	uint32_t t1 = act ? 0x494b61 : 0x2e2e3c;
+	uint32_t t2 = act ? 0x33344a : 0x24242f;
+	fill_round_rect_grad(w->x, w->y, w->w, TITLE_H, 8, t1, t2);
+	fill_rect(w->x, w->y + TITLE_H - 8, w->w, 8, t2);
+
+	/* type accent dot + title */
+	fill_circle(w->x + 14, w->y + TITLE_H / 2, 4, act ? win_accent(w) : 0x585b70);
+	draw_text_clip(w->x + 26, w->y + (TITLE_H - font_h) / 2, w->title,
+		       act ? 0xffffff : 0x9399b2, w->w - 26 - 84);
+
+	/* buttons: keep the three 24px bands the hit-test uses, draw them as dots */
+	int cy = w->y + TITLE_H / 2;
+	int closeX = w->x + w->w - 24, maxX = closeX - 24, minX = maxX - 24;
+	fill_circle(minX + 12,   cy, 6, act ? 0xa6e3a1 : 0x585b70);
+	fill_circle(maxX + 12,   cy, 6, act ? 0xf9e2af : 0x585b70);
+	fill_circle(closeX + 12, cy, 6, act ? 0xf38ba8 : 0x585b70);
 
 	int content_y = w->y + TITLE_H, content_h = w->h - TITLE_H;
 	if (content_h < 0)
@@ -638,50 +1092,71 @@ static void draw_window(struct window *w)
 	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
 
 	for (int r = 0; r < w->rows; r++) {
-		int cy = content_y + r * font_h;
+		int ry = content_y + r * font_h;
 		for (int c = 0; c < w->cols; c++) {
 			uint32_t bg = w->gbg[r][c];
 			if (bg != COL_BG_DEFAULT)
-				fill_rect(w->x + 4 + c * font_w, cy, font_w, font_h, bg);
+				fill_rect(w->x + 4 + c * font_w, ry, font_w, font_h, bg);
 		}
 	}
 	for (int r = 0; r < w->rows; r++) {
-		int cy = content_y + r * font_h;
+		int ry = content_y + r * font_h;
 		for (int c = 0; c < w->cols; c++) {
 			unsigned char ch = w->gch[r][c];
 			if (ch && ch != ' ')
-				blit_char(w->x + 4 + c * font_w, cy, ch, w->gfg[r][c]);
+				blit_char(w->x + 4 + c * font_w, ry, ch, w->gfg[r][c]);
 		}
 	}
 	if (w->type == WIN_TERM) {
-		int cx = w->x + 4 + w->cur_col * font_w;
-		int cy = content_y + w->cur_row * font_h + font_h - 2;
-		fill_rect(cx, cy, font_w, 2, 0xf9e2af);
+		int bx = w->x + 4 + w->cur_col * font_w;
+		int by = content_y + w->cur_row * font_h + font_h - 2;
+		fill_rect(bx, by, font_w, 2, 0xf9e2af);
 	}
 
-	if (!w->maximized)
-		fill_rect(w->x + w->w - 10, w->y + w->h - 10, 10, 10, 0x585b70);
+	/* resize grip: three diagonal pips */
+	if (!w->maximized) {
+		for (int k = 0; k < 3; k++) {
+			int gx = w->x + w->w - 5 - k * 4;
+			int gy = w->y + w->h - 5;
+			for (int m = 0; m <= k; m++)
+				fill_rect(gx, gy - m * 4, 2, 2, 0x6c7086);
+		}
+	}
 }
 
 static void draw_taskbar(void)
 {
-	fill_rect(0, yres - TASK_H, xres, TASK_H, 0x11111b);
-	int bx = 4;
+	int ty = yres - TASK_H;
+	fill_vgradient(0, ty, xres, TASK_H, 0x1c1c2a, 0x101018);
+	fill_rect(0, ty, xres, 1, 0x3a3a4d);
+
+	int bx = 8;
 	for (int zi = 0; zi < zcount; zi++) {
 		int i = zorder[zi];
 		if (!wins[i].used)
 			continue;
-		int bw = 130;
-		uint32_t bg = (i == focused && !wins[i].minimized) ? 0x45475a : 0x313244;
-		fill_rect(bx, yres - TASK_H + 4, bw, TASK_H - 8, bg);
-		draw_text_clip(bx + 6, yres - TASK_H + 4 + (TASK_H - 8 - font_h) / 2, wins[i].title, 0xffffff, bw - 12);
+		int bw = 130, bh = TASK_H - 10;
+		int by = ty + 5;
+		int act = (i == focused && !wins[i].minimized);
+		fill_round_rect_grad(bx, by, bw, bh, 5,
+				     act ? 0x4a4c63 : 0x2b2b3a,
+				     act ? 0x393b52 : 0x22222e);
+		if (act) /* accent underline on the focused task */
+			fill_round_rect(bx + 6, by + bh - 3, bw - 12, 2, 1, win_accent(&wins[i]));
+		fill_circle(bx + 11, by + bh / 2, 3,
+			    wins[i].minimized ? 0x585b70 : win_accent(&wins[i]));
+		draw_text_clip(bx + 20, by + (bh - font_h) / 2, wins[i].title,
+			       act ? 0xffffff : 0xa6adc8, bw - 28);
 		bx += bw + 6;
 	}
-	char timebuf[16];
+
+	char timebuf[24];
 	time_t t = time(NULL);
 	struct tm *tm = localtime(&t);
 	snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
-	draw_text_clip(xres - 80, yres - TASK_H + 4 + (TASK_H - 8 - font_h) / 2, timebuf, 0xffffff, 70);
+	int tw = (int)strlen(timebuf) * font_w;
+	fill_rect(xres - tw - 26, ty + 9, 1, TASK_H - 18, 0x3a3a4d);
+	draw_text(xres - tw - 14, ty + (TASK_H - font_h) / 2, timebuf, 0xcdd6f4);
 }
 
 static void cycle_window_focus(void)
@@ -698,6 +1173,7 @@ static void cycle_window_focus(void)
 	if (next == -1 && zcount > 0)
 		next = zorder[0];
 	if (next >= 0 && wins[next].used) {
+		focused = next; /* raise_window alone only reorders z; focus must follow */
 		if (wins[next].minimized) {
 			wins[next].minimized = 0;
 			if (wins[next].maximized) {
@@ -714,7 +1190,7 @@ static void cycle_window_focus(void)
 
 static void redraw_all(void)
 {
-	fill_rect(0, 0, xres, yres - TASK_H, 0x181825);
+	fill_vgradient(0, 0, xres, yres - TASK_H, 0x232338, 0x14141f);
 	draw_icons();
 	for (int zi = 0; zi < zcount; zi++) {
 		int i = zorder[zi];
@@ -789,27 +1265,41 @@ static void do_hit_test(int x, int y)
 			} else {
 				raise_window(i);
 				focused = i;
+				if (w->type == WIN_FILES)
+					fm_click(w, y);
 				return;
 			}
 		}
 	}
 
+	/* Press on an icon only *selects* it. It launches on release if the
+	 * pointer never moved; otherwise the motion turns into a drag. */
 	int idx = icon_at(x, y);
 	if (idx >= 0) {
-		struct icon *ic = &icons[idx];
-		if (ic->action == 1) {
-			run_and_show("echo Rebooting...");
-			usleep(500000);
-			system("reboot");
-		} else if (ic->action == 2) {
-			run_and_show("echo Powering off...");
-			usleep(500000);
-			system("poweroff -f");
-		} else if (ic->action == 3) {
-			spawn_terminal();
-		} else {
-			spawn_output_window(ic->label, ic->cmd);
-		}
+		icon_press = idx;
+		icon_dragged = 0;
+		icon_grab_dx = x - icons[idx].x;
+		icon_grab_dy = y - icons[idx].y;
+	}
+}
+
+static void launch_icon(int idx)
+{
+	struct icon *ic = &icons[idx];
+	if (ic->action == 1) {
+		run_and_show("echo Rebooting...");
+		usleep(500000);
+		system("reboot");
+	} else if (ic->action == 2) {
+		run_and_show("echo Powering off...");
+		usleep(500000);
+		system("poweroff -f");
+	} else if (ic->action == 3) {
+		spawn_terminal();
+	} else if (ic->action == 4) {
+		spawn_file_window();
+	} else {
+		spawn_output_window(ic->label, ic->cmd);
 	}
 }
 
@@ -838,13 +1328,36 @@ static int process_pointer(int nx, int ny, int left)
 		if (wins[drag_win].h < WIN_MINH) wins[drag_win].h = WIN_MINH;
 		resize_notify(&wins[drag_win]);
 		changed = 1;
+	} else if (left && prev_left && icon_press >= 0) {
+		/* Past a few pixels of travel this is a drag, not a click. */
+		if (!icon_dragged && (dx * dx + dy * dy) > 0) {
+			int tx = mx - icon_grab_dx - icons[icon_press].x;
+			int ty = my - icon_grab_dy - icons[icon_press].y;
+			if (tx * tx + ty * ty > 9)
+				icon_dragged = 1;
+		}
+		if (icon_dragged) {
+			icons[icon_press].x = mx - icon_grab_dx;
+			icons[icon_press].y = my - icon_grab_dy;
+			clamp_icon(&icons[icon_press]);
+			changed = 1;
+		}
 	} else if (left && !prev_left) {
 		do_hit_test(mx, my);
 		changed = 1;
 	}
+
 	if (!left && prev_left) {
 		if (drag_mode == 2 && drag_win >= 0 && wins[drag_win].used)
 			resize_notify(&wins[drag_win]);
+		if (icon_press >= 0) {
+			int idx = icon_press;
+			int was_drag = icon_dragged;
+			icon_press = -1;
+			icon_dragged = 0;
+			if (!was_drag)
+				launch_icon(idx); /* a click that never moved */
+		}
 		changed = 1;
 	}
 	if (left != prev_left)
@@ -1033,6 +1546,8 @@ int main(void)
 	DBG("[fbdesktop] xres=%d yres=%d bpp=%d have_font=%d font_w=%d font_h=%d\n",
 		xres, yres, bpp, have_font, font_w, font_h);
 
+	init_icon_positions(); /* needs xres/yres; without it every icon sits at 0,0 */
+
 	open_input_devices();
 	/* Only fall back to relative PS/2 mouse when no absolute tablet exists,
 	 * otherwise mousedev would relay the tablet as relative and cause drift. */
@@ -1111,10 +1626,14 @@ int main(void)
 			char buf[64];
 			int r = read(STDIN_FILENO, buf, sizeof(buf));
 			/* Swallow keystrokes while Alt is held so Alt+Tab's ESC/Tab bytes
-			 * don't leak into the focused shell. */
-			if (r > 0 && !alt_held && focused >= 0 && wins[focused].used &&
-			    wins[focused].type == WIN_TERM)
-				write(wins[focused].pty_fd, buf, r);
+			 * don't leak into the focused window. */
+			if (r > 0 && !alt_held && focused >= 0 && wins[focused].used) {
+				if (wins[focused].type == WIN_TERM)
+					write(wins[focused].pty_fd, buf, r);
+				else if (wins[focused].type == WIN_FILES &&
+					 fm_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+			}
 		}
 		for (int i = 0; i < MAX_WIN; i++) {
 			if (win_i[i] >= 0 && (fds[win_i[i]].revents & (POLLIN | POLLHUP))) {
