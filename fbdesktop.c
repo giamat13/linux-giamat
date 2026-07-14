@@ -125,7 +125,7 @@ struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings,7=cmd in a terminal window */
+	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings,7=X app */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
@@ -134,7 +134,7 @@ static struct icon icons[] = {
 	{"TASK MGR",  NULL, 0x3b82f6, 5, G_GAUGE},
 	{"FILES",     NULL, 0x06b6d4, 4, G_FOLDER},
 	{"TERMINAL",  NULL, 0x9333ea, 3, G_TERM},
-	{"BROWSER",   "lynx https://lite.duckduckgo.com/lite/", 0x0ea5e9, 7, G_GLOBE},
+	{"BROWSER",   "/bin/browser", 0x0ea5e9, 7, G_GLOBE},
 	{"SETTINGS",  NULL, 0x64748b, 6, G_GEAR},
 	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
 	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
@@ -326,6 +326,8 @@ static unsigned char font[512 * 32 * 4];
 static int have_font;
 static int font_w = 8, font_h = 16, font_bpr = 1;
 static int mx, my, prev_left, prev_right;
+/* /dev/tty1, kept open so the console mode can be handed back and forth with X */
+static int confd = -1;
 /* absolute pointer (evdev tablet) + evdev keyboard for Alt+Tab */
 static int absptr_fd = -1, kbd_evdev_fd = -1;
 static int abs_minx, abs_maxx, abs_miny, abs_maxy;
@@ -1055,9 +1057,7 @@ static int alloc_window_slot(void)
 	return -1;
 }
 
-/* Backs a window with a pty. `cmd` NULL runs an interactive shell; otherwise it
- * is handed to sh -c, which is how the browser icon reuses the VT100 grid. */
-static int spawn_terminal(const char *cmd, const char *title)
+static int spawn_terminal(void)
 {
 	int slot = alloc_window_slot();
 	if (slot < 0)
@@ -1096,10 +1096,7 @@ static int spawn_terminal(const char *cmd, const char *title)
 			if (i != slot && wins[i].used && wins[i].type == WIN_TERM)
 				close(wins[i].pty_fd);
 		setenv("TERM", "linux", 1);
-		if (cmd)
-			execl("/bin/sh", "sh", "-c", cmd, NULL);
-		else
-			execl("/bin/sh", "sh", NULL);
+		execl("/bin/sh", "sh", NULL);
 		_exit(1);
 	} else if (pid < 0) {
 		close(master);
@@ -1113,15 +1110,11 @@ static int spawn_terminal(const char *cmd, const char *title)
 	wins[slot].pid = pid;
 	wins[slot].x = 200 + slot * 24;
 	wins[slot].y = 120 + slot * 24;
-	/* A page of text needs more columns than a shell prompt does. */
-	wins[slot].w = cmd ? 820 : 560;
-	wins[slot].h = cmd ? 560 : 360;
+	wins[slot].w = 560;
+	wins[slot].h = 360;
 	wins[slot].attr_fg = COL_FG_DEFAULT;
 	wins[slot].attr_bg = COL_BG_DEFAULT;
-	if (title)
-		snprintf(wins[slot].title, sizeof(wins[slot].title), "%s", title);
-	else
-		snprintf(wins[slot].title, sizeof(wins[slot].title), "Terminal %d", slot + 1);
+	snprintf(wins[slot].title, sizeof(wins[slot].title), "Terminal %d", slot + 1);
 	update_grid_dims(&wins[slot]);
 	for (int r = 0; r < wins[slot].rows; r++)
 		clear_row_range(&wins[slot], r, 0, wins[slot].cols - 1);
@@ -2895,6 +2888,27 @@ static void do_hit_test(int x, int y)
 	}
 }
 
+/* Hand the whole screen to an X client (the browser) and block until it quits.
+ * X drives the same framebuffer we do, so the one thing we must not do while it
+ * runs is keep drawing -- blocking here is what keeps the two off each other. */
+static void run_x_app(const char *cmd)
+{
+	if (!cmd)
+		return;
+	/* The kernel refuses to switch away from a VT that is in KD_GRAPHICS, so
+	 * leaving it set here hangs X forever inside VT_WAITACTIVE on its own vt. */
+	if (confd >= 0)
+		ioctl(confd, KDSETMODE, KD_TEXT);
+
+	int rc = system(cmd);
+	(void)rc;
+
+	if (confd >= 0)
+		ioctl(confd, KDSETMODE, KD_GRAPHICS);
+	/* Keys pressed while X held the console are still queued on our stdin. */
+	tcflush(STDIN_FILENO, TCIFLUSH);
+}
+
 static void launch_icon(int idx)
 {
 	struct icon *ic = &icons[idx];
@@ -2907,9 +2921,9 @@ static void launch_icon(int idx)
 		usleep(500000);
 		system("poweroff -f");
 	} else if (ic->action == 3) {
-		spawn_terminal(NULL, NULL);
+		spawn_terminal();
 	} else if (ic->action == 7) {
-		spawn_terminal(ic->cmd, "Browser");
+		run_x_app(ic->cmd);
 	} else if (ic->action == 4) {
 		spawn_file_window();
 	} else if (ic->action == 5) {
@@ -3205,7 +3219,7 @@ int main(void)
 	if (dbg)
 		setvbuf(dbg, NULL, _IONBF, 0);
 
-	int confd = open("/dev/tty1", O_RDWR);
+	confd = open("/dev/tty1", O_RDWR);
 	if (confd >= 0) {
 		struct console_font_op op;
 		memset(&op, 0, sizeof(op));
