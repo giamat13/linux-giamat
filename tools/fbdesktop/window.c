@@ -1,0 +1,250 @@
+/* fbdesktop -- window records: z-order, focus, open/close, maximize, clamping,
+ * and the window frame itself */
+#include "fbdesktop.h"
+
+void raise_window(int i)
+{
+	sd_active = 0; /* touching a window means we're no longer showing the desktop */
+	for (int zi = 0; zi < zcount; zi++) {
+		if (zorder[zi] == i) {
+			for (int k = zi; k < zcount - 1; k++)
+				zorder[k] = zorder[k + 1];
+			zcount--;
+			break;
+		}
+	}
+	zorder[zcount++] = i;
+}
+
+void close_window(int i)
+{
+	if (!wins[i].used)
+		return;
+	if (wins[i].type == WIN_BROWSER)
+		browser_teardown();
+	if (wins[i].type == WIN_TERM) {
+		close(wins[i].pty_fd);
+		if (wins[i].pid > 0) {
+			kill(wins[i].pid, SIGTERM);
+			waitpid(wins[i].pid, NULL, 0);
+		}
+	}
+	if (wins[i].fm) {
+		free(wins[i].fm);
+		wins[i].fm = NULL;
+	}
+	if (wins[i].ed) {
+		free(wins[i].ed);
+		wins[i].ed = NULL;
+	}
+	wins[i].used = 0;
+	for (int zi = 0; zi < zcount; zi++) {
+		if (zorder[zi] == i) {
+			for (int k = zi; k < zcount - 1; k++)
+				zorder[k] = zorder[k + 1];
+			zcount--;
+			break;
+		}
+	}
+	if (focused == i)
+		focused = zcount > 0 ? zorder[zcount - 1] : -1;
+	if (drag_win == i) {
+		drag_win = -1;
+		drag_mode = 0;
+	}
+	if (ctxmenu_mode == CTXMODE_FILEWIN && ctxmenu_win == i) {
+		ctxmenu_win = -1;
+		ctxmenu_mode = CTXMODE_NONE;
+	}
+	if (fmdrag_win == i) {
+		fmdrag_win = -1;
+		fmdrag_entidx = -1;
+		fmdrag_active = 0;
+	}
+}
+
+void toggle_maximize(int i)
+{
+	struct window *w = &wins[i];
+	if (!w->maximized) {
+		w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
+		w->x = 0; w->y = 0; w->w = xres; w->h = yres - TASK_H;
+		w->maximized = 1;
+	} else {
+		w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh;
+		w->maximized = 0;
+	}
+	resize_notify(w);
+}
+
+int alloc_window_slot(void)
+{
+	for (int i = 0; i < MAX_WIN; i++)
+		if (!wins[i].used)
+			return i;
+	return -1;
+}
+
+/* Small colored dot per window type, drawn in the titlebar. */
+uint32_t win_accent(const struct window *w)
+{
+	if (w->type == WIN_TERM)  return 0x9333ea;
+	if (w->type == WIN_FILES) return 0x06b6d4;
+	if (w->type == WIN_EDIT)  return 0xa6e3a1;
+	return themes[theme_idx].accent;
+}
+
+void draw_window(struct window *w)
+{
+	int i = (int)(w - wins);
+	int act = (i == focused);
+
+	/* drop shadow */
+	fill_round_rect(w->x + 5, w->y + 6, w->w, w->h, 9, 0x0a0a11);
+	/* frame: a 1px outline that brightens when focused */
+	fill_round_rect(w->x - 1, w->y - 1, w->w + 2, w->h + 2, 9,
+			act ? 0x6c7086 : 0x2a2a38);
+
+	/* titlebar: rounded on top, squared where it meets the content */
+	uint32_t t1 = act ? 0x494b61 : 0x2e2e3c;
+	uint32_t t2 = act ? 0x33344a : 0x24242f;
+	fill_round_rect_grad(w->x, w->y, w->w, TITLE_H, 8, t1, t2);
+	fill_rect(w->x, w->y + TITLE_H - 8, w->w, 8, t2);
+
+	/* type accent dot + title */
+	fill_circle(w->x + 14, w->y + TITLE_H / 2, 4, act ? win_accent(w) : 0x585b70);
+	draw_text_clip(w->x + 26, w->y + (TITLE_H - font_h) / 2, w->title,
+		       act ? 0xffffff : 0x9399b2, w->w - 26 - 84);
+
+	/* buttons: keep the three 24px bands the hit-test uses, draw them as dots */
+	int cy = w->y + TITLE_H / 2;
+	int closeX = w->x + w->w - 24, maxX = closeX - 24, minX = maxX - 24;
+	fill_circle(minX + 12,   cy, 6, act ? 0xa6e3a1 : 0x585b70);
+	fill_circle(maxX + 12,   cy, 6, act ? 0xf9e2af : 0x585b70);
+	fill_circle(closeX + 12, cy, 6, act ? 0xf38ba8 : 0x585b70);
+
+	int content_y = w->y + TITLE_H, content_h = w->h - TITLE_H;
+	if (content_h < 0)
+		content_h = 0;
+
+	if (w->type == WIN_BROWSER) {
+		draw_browser(w);
+		return; /* the X server owns these pixels; we only copy them */
+	}
+
+	if (w->type == WIN_SETTINGS) {
+		fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
+		draw_settings(w, content_y);
+		return; /* no grid, no resize grip -- settings is a fixed panel */
+	}
+
+	/* file-manager toolbar sits between titlebar and listing */
+	if (w->type == WIN_FILES && w->fm) {
+		struct fmstate *fm = w->fm;
+		fill_rect(w->x, content_y, w->w, FM_TOOLH, 0x181826);
+		for (int b = 0; b < FM_NBTN; b++) {
+			int bx = w->x + 6 + b * (FM_BTNW + 4);
+			int armed = (b == 2 && fm->confirm_del);
+			fill_round_rect_grad(bx, content_y + 3, FM_BTNW, FM_TOOLH - 6, 4,
+					     armed ? 0xf38ba8 : 0x2b2b3a,
+					     armed ? 0xc4506a : 0x22222e);
+			int lw = (int)strlen(fm_btns[b]) * font_w;
+			draw_text_clip(bx + (FM_BTNW - lw) / 2,
+				       content_y + (FM_TOOLH - font_h) / 2,
+				       fm_btns[b], 0xdfe4f2, FM_BTNW - 6);
+		}
+		/* name prompt / search / status share the strip right of the buttons */
+		int tx = w->x + 6 + FM_NBTN * (FM_BTNW + 4) + 6;
+		int ty2 = content_y + (FM_TOOLH - font_h) / 2;
+		if (fm->prompt) {
+			static const char *plabel[] = { "", "file", "dir", "rename" };
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "%s: %s_", plabel[fm->prompt], fm->pbuf);
+			draw_text_clip(tx, ty2, line, 0xf9e2af, w->x + w->w - tx - 6);
+		} else if (fm->searching) {
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "search: %s_", fm->search);
+			draw_text_clip(tx, ty2, line, 0x94e2d5, w->x + w->w - tx - 6);
+		} else if (fm->status[0]) {
+			draw_text_clip(tx, ty2, fm->status, 0x9399b2, w->x + w->w - tx - 6);
+		} else if (fm->search[0]) {
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "filter: %s", fm->search);
+			draw_text_clip(tx, ty2, line, 0x6c7086, w->x + w->w - tx - 6);
+		}
+		content_y += FM_TOOLH;
+		content_h -= FM_TOOLH;
+	}
+
+	/* task-manager tab strip sits between titlebar and content */
+	if (w->type == WIN_TASKMGR) {
+		int tw = w->w / TM_NTABS;
+		fill_rect(w->x, content_y, w->w, TM_TABH, 0x181826);
+		for (int t = 0; t < TM_NTABS; t++) {
+			int tx = w->x + t * tw;
+			int on = (t == w->tab);
+			fill_rect(tx, content_y, tw - 1, TM_TABH,
+				  on ? COL_BG_DEFAULT : 0x232338);
+			if (on)
+				fill_rect(tx, content_y, tw - 1, 2, win_accent(w));
+			int lw = (int)strlen(tm_tabs[t].label) * font_w;
+			draw_text_clip(tx + (tw - lw) / 2,
+				       content_y + (TM_TABH - font_h) / 2,
+				       tm_tabs[t].label,
+				       on ? 0xffffff : 0x9399b2, tw - 6);
+		}
+		content_y += TM_TABH;
+		content_h -= TM_TABH;
+
+		if (w->tab == 1 && content_h > TM_GRAPH_H) {
+			fill_rect(w->x, content_y, w->w, TM_GRAPH_H, COL_BG_DEFAULT);
+			int gw = (w->w - 24) / 2, gh = TM_GRAPH_H - 16;
+			draw_graph(w->x + 8, content_y + 8, gw, gh, cpu_hist, 0x89b4fa, "CPU");
+			draw_graph(w->x + 16 + gw, content_y + 8, gw, gh, mem_hist, 0xa6e3a1, "MEM");
+			content_y += TM_GRAPH_H;
+			content_h -= TM_GRAPH_H;
+		}
+	}
+
+	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
+
+	for (int r = 0; r < w->rows; r++) {
+		int ry = content_y + r * font_h;
+		for (int c = 0; c < w->cols; c++) {
+			uint32_t bg = w->gbg[r][c];
+			if (bg != COL_BG_DEFAULT)
+				fill_rect(w->x + 4 + c * font_w, ry, font_w, font_h, bg);
+		}
+	}
+	for (int r = 0; r < w->rows; r++) {
+		int ry = content_y + r * font_h;
+		for (int c = 0; c < w->cols; c++) {
+			unsigned char ch = w->gch[r][c];
+			if (ch && ch != ' ')
+				blit_char(w->x + 4 + c * font_w, ry, ch, w->gfg[r][c]);
+		}
+	}
+	if (w->type == WIN_TERM || w->type == WIN_EDIT) {
+		int bx = w->x + 4 + w->cur_col * font_w;
+		int by = content_y + w->cur_row * font_h + font_h - 2;
+		fill_rect(bx, by, font_w, 2, 0xf9e2af);
+	}
+
+	/* resize grip: three diagonal pips */
+	if (!w->maximized) {
+		for (int k = 0; k < 3; k++) {
+			int gx = w->x + w->w - 5 - k * 4;
+			int gy = w->y + w->h - 5;
+			for (int m = 0; m <= k; m++)
+				fill_rect(gx, gy - m * 4, 2, 2, 0x6c7086);
+		}
+	}
+}
+
+void clamp_window(struct window *w)
+{
+	if (w->x < -w->w + 40) w->x = -w->w + 40;
+	if (w->y < 0) w->y = 0;
+	if (w->x > xres - 40) w->x = xres - 40;
+	if (w->y > yres - TASK_H - TITLE_H) w->y = yres - TASK_H - TITLE_H;
+}

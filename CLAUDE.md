@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A fork of the Linux kernel (7.2-rc3) plus a small out-of-tree userspace experiment. Nearly all files are upstream kernel source — treat them as upstream unless `git log` shows a local commit touching them. The local work so far has been only:
 
-- `fbdesktop.c` — a standalone userspace framebuffer desktop (not kernel code, not built by Kbuild).
+- `tools/fbdesktop/` — a standalone userspace framebuffer desktop (the shell: framebuffer, windows, character grid, event loop) plus its `Makefile` and `include/`, and `tools/apps/` — one file per application window. Built out-of-tree with `make -C tools/fbdesktop`, which links both into the single `fbdesktop` binary. Userspace, not kernel code, never built by Kbuild — it lives under `tools/` because that is where this tree keeps its userspace programs (`tools/perf`, `tools/bpf`, …).
 - `build-rootfs.sh` / `build-initramfs.sh` / `build-iso.sh` — package the kernel + a Debian rootfs + fbdesktop into a bootable ISO.
 - Local netfilter changes (`net/netfilter/xt_{hl,dscp,rateest,tcpmss}.c` and their uapi headers, commit `1db51fc`).
 
-This list describes where past changes happened to land, not a restriction on where future ones may land. Pick whichever files the task actually needs — including kernel subsystems, Kconfig, or drivers — rather than defaulting to `fbdesktop.c` out of habit.
+This list describes where past changes happened to land, not a restriction on where future ones may land. Pick whichever files the task actually needs — including kernel subsystems, Kconfig, or drivers — rather than defaulting to the userspace desktop out of habit.
 
 **Priority order when choosing an approach and which files to touch:**
 1. Correctness and quality first — the result must actually be the best solution to the task (and must still satisfy "must boot on real hardware" below). Never downgrade quality to save cost.
@@ -28,7 +28,7 @@ Before running `qemu-system-x86_64`, make sure it can't crash or destabilize the
 
 ```sh
 make -j$(nproc) bzImage                              # -> arch/x86/boot/bzImage
-gcc -O2 -o ~/build/fbdesktop fbdesktop.c -lX11 -lXext -lXtst
+make -C tools/fbdesktop -j$(nproc)                   # -> ~/build/fbdesktop
 sudo ./build-rootfs.sh   # debootstrap + Xvfb + Firefox -> ~/build/rootfs.squashfs
 ./build-initramfs.sh     # tiny busybox initramfs       -> ~/build/initramfs.img
 ./build-iso.sh           # grub-mkrescue                -> ~/build/linux-giamat.iso
@@ -52,9 +52,31 @@ The kernel config needs framebuffer console, evdev/mousedev, devtmpfs, `SQUASHFS
 
 ## fbdesktop architecture
 
-Single file, no toolkit. It draws pixels straight into a mmap'd `/dev/fb0`, reads the mouse from an evdev absolute pointer (or `/dev/input/mice`), takes keyboard from stdin in raw termios mode, and lifts its bitmap font from the kernel's own VT console font via `KDFONTOP` — so the font depends on the running kernel, not on any file in the image.
+A small multi-file program, no toolkit. It is split the way `tools/perf` is: one shell plus the things it launches, all linked into one binary. The shell lives in `tools/fbdesktop/`; each application window is one file in `tools/apps/`. They are not separate programs — an "app" here is a window kind, and it links into the same executable. Shared types, constants, extern globals and cross-module prototypes live in `tools/fbdesktop/include/fbdesktop.h`; everything else is `static` inside its own file.
 
-The model is a small window manager: icons open windows, windows are draggable/resizable/minimisable, and there's a taskbar. State lives in fixed-size arrays (`MAX_WIN`, `GRID_MAXCOLS/ROWS`); there is no allocation-heavy scene graph. Changing layout constants at the top of the file is usually the right knob rather than adding structure.
+| `tools/fbdesktop/` (the shell) | Responsibility |
+| --- | --- |
+| `main.c` | framebuffer/font/input setup, hit testing, icon launching, event loop |
+| `desktop.c` | file-type classification, icons, desktop directory, taskbar, context menu, compositor (`redraw_all`) |
+| `window.c` | window records: z-order, focus, open/close/maximize/clamp, frame drawing |
+| `draw.c` | framebuffer primitives: pixels, rects, text, vector glyphs |
+| `grid.c` | the character grid + VT100-ish parser every window type renders into |
+| `globals.c` | definitions of the shared state declared `extern` in the header |
+
+| `tools/apps/` (one window kind each) | Responsibility |
+| --- | --- |
+| `terminal.c` | live pty-backed terminal, and the one-shot command-output view |
+| `files.c` | file manager: listing, search, clipboard, drag-and-drop, file operations |
+| `editor.c` | text editor |
+| `taskmgr.c` | task manager tabs + CPU/memory sampler and graphs |
+| `settings.c` | settings |
+| `browser.c` | Xvfb + Firefox, MIT-SHM capture, XTEST input |
+
+A new app is a new file in `tools/apps/`, its name added to `APP_SRCS` in the Makefile, an icon in `icons[]` (`globals.c`), and a case in `launch_icon()` (`main.c`).
+
+It draws pixels straight into a mmap'd `/dev/fb0`, reads the mouse from an evdev absolute pointer (or `/dev/input/mice`), takes keyboard from stdin in raw termios mode, and lifts its bitmap font from the kernel's own VT console font via `KDFONTOP` — so the font depends on the running kernel, not on any file in the image.
+
+The model is a small window manager: icons open windows, windows are draggable/resizable/minimisable, and there's a taskbar. State lives in fixed-size arrays (`MAX_WIN`, `GRID_MAXCOLS/ROWS`); there is no allocation-heavy scene graph. Changing layout constants in `tools/fbdesktop/include/fbdesktop.h` is usually the right knob rather than adding structure.
 
 **The browser window (`WIN_BROWSER`) is the one thing fbdesktop does not draw itself.** Firefox runs on a headless Xvfb sized to the whole screen; fbdesktop is an X client of it, pulls the root image over MIT-SHM each frame, blits it into an ordinary window, and feeds clicks and keys back with XTEST. That is why it minimises, maximises and sits in the taskbar like any other window. Firefox's top-level is resized to the window's content area on every geometry change (override-redirect children are skipped — they are menus and popups, and stretching them wrecks them). There is no Xorg, no VT switching and no DRM master anywhere in this path.
 
@@ -67,6 +89,10 @@ Because it owns the framebuffer and the tty directly, a crash leaves the console
 ## Workflow
 
 Always maintain a TODO list (via the TodoWrite tool) for any non-trivial task in this repo, and keep it updated as work progresses.
+
+Delegate to subagents. Hand off most small, self-contained tasks; keep the large and architectural work yourself. Always verify the whole result yourself at the end — a subagent's report is a claim, never verification.
+
+Put every file in the directory where it belongs: an existing one if one fits, a new one if none does. The repo root is a kernel tree — never dump loose source files there. Userspace code goes under `tools/`, in a directory named for what it is, following whatever the surrounding tree already does. When unsure how to lay something out, look at how this repo (or a well-known project) already solves the same shape, rather than inventing a structure.
 
 ## Kernel work
 
