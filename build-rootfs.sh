@@ -26,16 +26,17 @@ mount --bind /proc "$ROOTFS/proc"
 mount --bind /sys  "$ROOTFS/sys"
 mount --bind /dev  "$ROOTFS/dev"
 
-echo "=== installing Xorg + Firefox ==="
-# xserver-xorg-video-fbdev is the fallback for machines whose GPU has no KMS
-# driver here; on QEMU and Intel the modesetting driver in -core takes over.
+echo "=== installing Xvfb + Firefox ==="
+# No Xorg: Firefox runs on a headless Xvfb and fbdesktop copies its screen into
+# a window. That means no VT juggling, no DRM master, no udev-fed input devices.
 chroot "$ROOTFS" /bin/bash -c '
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq
+	# xkb-data + xkbcomp are not optional: Xvfb refuses to start without a
+	# keymap it can compile, even though nothing here has a real keyboard.
 	apt-get install -y --no-install-recommends \
-		xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput \
-		xinit firefox-esr fonts-dejavu-core ca-certificates dbus-x11 \
-		libgl1-mesa-dri x11-xserver-utils
+		xvfb xkb-data x11-xkb-utils firefox-esr fonts-dejavu-core \
+		ca-certificates dbus-x11 libgl1-mesa-dri libx11-6 libxext6 libxtst6
 	apt-get clean
 '
 
@@ -43,22 +44,6 @@ echo "=== fbdesktop + its runtime ==="
 install -m 755 ~/build/fbdesktop "$ROOTFS/bin/fbdesktop"
 # The Debian base has no DHCP client; busybox brings udhcpc along with it.
 install -m 755 /bin/busybox "$ROOTFS/bin/busybox"
-
-# Firefox is launched on its own VT. startx blocks, so fbdesktop stays frozen
-# (and off the framebuffer) for exactly as long as the browser is up.
-cat > "$ROOTFS/bin/browser" <<'EOF'
-#!/bin/sh
-# fbdesktop owns the framebuffer, so anything X says would land on pixels we are
-# about to overwrite. Send it to the serial console, where it can be read.
-exec >> /dev/ttyS0 2>&1
-export HOME=/root
-echo "=== browser: starting X ==="
-# -logfile /dev/ttyS0 streams the driver probe out live; without it a failure
-# during probe leaves nothing to look at, since /var/log is a RAM overlay.
-startx /usr/bin/firefox-esr --no-remote -- :0 vt7 -nolisten tcp -logfile /dev/ttyS0
-echo "=== browser: X exited rc=$? ==="
-EOF
-chmod 755 "$ROOTFS/bin/browser"
 
 mkdir -p "$ROOTFS/usr/share/udhcpc"
 cat > "$ROOTFS/usr/share/udhcpc/default.script" <<'EOF'
@@ -96,12 +81,8 @@ mount -t tmpfs none /run
 # comes up with no cookie for Firefox to authenticate against.
 hostname linux-giamat
 echo "127.0.0.1 localhost linux-giamat" > /etc/hosts
-
-# X's AutoAddDevices finds the mouse and keyboard through udev. Nothing else
-# starts it here, so without this the browser comes up with no input at all.
-/lib/systemd/systemd-udevd --daemon
-udevadm trigger --action=add
-udevadm settle --timeout=10
+# Xvfb needs this to exist and be world-writable, or it cannot bind its socket.
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 export HOME=/root
 # A shell on the serial line: the framebuffer belongs to fbdesktop, so this is

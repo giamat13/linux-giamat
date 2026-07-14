@@ -200,3 +200,5 @@ sphinx_*/
 
 
 *.iso
+# Build artifacts: the ISO is ~300MB, it does not belong in git
+/dist/
