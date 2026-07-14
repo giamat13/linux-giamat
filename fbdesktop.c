@@ -41,17 +41,17 @@
 #define COL_FG_DEFAULT 0xcdd6f4
 #define COL_BG_DEFAULT 0x1e1e2e
 
-enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR };
+enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS };
 
 enum glyph {
-	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER
+	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR
 };
 
 struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 1=reboot,2=poweroff,3=terminal,4=file manager,5=task manager */
+	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
@@ -60,10 +60,30 @@ static struct icon icons[] = {
 	{"TASK MGR",  NULL, 0x3b82f6, 5, G_GAUGE},
 	{"FILES",     NULL, 0x06b6d4, 4, G_FOLDER},
 	{"TERMINAL",  NULL, 0x9333ea, 3, G_TERM},
+	{"SETTINGS",  NULL, 0x64748b, 6, G_GEAR},
 	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
 	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
 };
 #define NUM_ICONS (int)(sizeof(icons)/sizeof(icons[0]))
+
+/* Desktop themes -- the only setting that has any effect at runtime; the
+ * framebuffer mode itself is fixed by GRUB's gfxpayload at boot. */
+struct theme {
+	const char *name;
+	uint32_t dtop, dbot, accent;
+};
+static const struct theme themes[] = {
+	{"Midnight", 0x232338, 0x14141f, 0x3b82f6},
+	{"Forest",   0x1e2f24, 0x0d1712, 0x22c55e},
+	{"Ember",    0x2f2420, 0x1a1210, 0xf97316},
+};
+#define NUM_THEMES (int)(sizeof(themes)/sizeof(themes[0]))
+static int theme_idx;
+
+/* One-second samples of CPU / memory use, oldest first. */
+#define HIST 60
+static int cpu_hist[HIST], mem_hist[HIST];
+#define TM_GRAPH_H 120
 
 /* Task Manager tabs -- one window, Windows-style, auto-refreshing. */
 struct tmtab {
@@ -107,6 +127,21 @@ struct fmstate {
 	int scroll;
 };
 
+/* Text editor state, allocated only for WIN_EDIT windows. */
+#define ED_MAXLINES 1024
+#define ED_MAXCOL 240
+
+struct edstate {
+	char path[FM_FULLLEN];
+	char line[ED_MAXLINES][ED_MAXCOL];
+	int nlines;
+	int cy, cx;   /* caret in buffer coords */
+	int scroll;
+	int dirty;
+	int truncated; /* file didn't fit: refuse to save over it */
+	char status[64];
+};
+
 struct window {
 	int used;
 	enum wintype type;
@@ -118,6 +153,7 @@ struct window {
 	int pty_fd;
 	pid_t pid;
 	struct fmstate *fm; /* WIN_FILES only */
+	struct edstate *ed; /* WIN_EDIT only */
 	int tab;            /* WIN_TASKMGR: active tab */
 
 	int cols, rows;
@@ -138,6 +174,8 @@ static int focused = -1;
 static int drag_mode; /* 0 none, 1 move, 2 resize */
 static int drag_win = -1;
 static int alt_held;
+static int sd_active;      /* "show desktop" is on: everything was minimized */
+static int sd_saved[MAX_WIN];
 
 static uint8_t *fbp;      /* real framebuffer */
 static uint8_t *backbuf;  /* offscreen: draw here, then flush in one memcpy */
@@ -379,6 +417,17 @@ static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_rect(cx - 5, cy - 16, 10, 12, hole);  /* gap at the top */
 		fill_round_rect(cx - 2, cy - 18, 5, 18, 2, fg);
 		break;
+	case G_GEAR:
+		/* four teeth + body + hub */
+		fill_round_rect(cx - 4, cy - 20, 8, 40, 2, fg);
+		fill_round_rect(cx - 20, cy - 4, 40, 8, 2, fg);
+		fill_round_rect(cx - 14, cy - 16, 8, 8, 2, fg);
+		fill_round_rect(cx + 6, cy - 16, 8, 8, 2, fg);
+		fill_round_rect(cx - 14, cy + 8, 8, 8, 2, fg);
+		fill_round_rect(cx + 6, cy + 8, 8, 8, 2, fg);
+		fill_circle(cx, cy, 14, fg);
+		fill_circle(cx, cy, 6, hole);
+		break;
 	default:
 		break;
 	}
@@ -443,8 +492,11 @@ static int icon_at(int px, int py)
 static void update_grid_dims(struct window *w)
 {
 	int content_h = w->h - TITLE_H;
-	if (w->type == WIN_TASKMGR)
+	if (w->type == WIN_TASKMGR) {
 		content_h -= TM_TABH;
+		if (w->tab == 1)
+			content_h -= TM_GRAPH_H; /* graphs sit above the text */
+	}
 	int newcols = (w->w - 8) / font_w;
 	int newrows = content_h / font_h;
 	if (newcols > GRID_MAXCOLS) newcols = GRID_MAXCOLS;
@@ -458,12 +510,16 @@ static void update_grid_dims(struct window *w)
 }
 
 static void fm_render(struct window *w);
+static void ed_render(struct window *w);
+static int spawn_editor(const char *path);
 
 static void resize_notify(struct window *w)
 {
 	update_grid_dims(w);
 	if (w->type == WIN_FILES && w->fm)
 		fm_render(w);
+	if (w->type == WIN_EDIT && w->ed)
+		ed_render(w);
 	if (w->type == WIN_TERM && w->pty_fd >= 0) {
 		struct winsize ws;
 		memset(&ws, 0, sizeof(ws));
@@ -655,6 +711,7 @@ static void run_and_show(const char *cmd)
 
 static void raise_window(int i)
 {
+	sd_active = 0; /* touching a window means we're no longer showing the desktop */
 	for (int zi = 0; zi < zcount; zi++) {
 		if (zorder[zi] == i) {
 			for (int k = zi; k < zcount - 1; k++)
@@ -680,6 +737,10 @@ static void close_window(int i)
 	if (wins[i].fm) {
 		free(wins[i].fm);
 		wins[i].fm = NULL;
+	}
+	if (wins[i].ed) {
+		free(wins[i].ed);
+		wins[i].ed = NULL;
 	}
 	wins[i].used = 0;
 	for (int zi = 0; zi < zcount; zi++) {
@@ -820,35 +881,13 @@ static void fill_grid_from_cmd(struct window *w, const char *cmd)
 	w->cur_col = 0;
 }
 
-static int spawn_output_window(const char *title, const char *cmd)
-{
-	int slot = alloc_window_slot();
-	if (slot < 0)
-		return -1;
-	memset(&wins[slot], 0, sizeof(wins[slot]));
-	wins[slot].used = 1;
-	wins[slot].type = WIN_OUTPUT;
-	wins[slot].pty_fd = -1;
-	wins[slot].x = 220 + slot * 24;
-	wins[slot].y = 140 + slot * 24;
-	wins[slot].w = 560;
-	wins[slot].h = 380;
-	wins[slot].attr_fg = COL_FG_DEFAULT;
-	wins[slot].attr_bg = COL_BG_DEFAULT;
-	snprintf(wins[slot].title, sizeof(wins[slot].title), "%s", title);
-	update_grid_dims(&wins[slot]);
-	fill_grid_from_cmd(&wins[slot], cmd);
-	zorder[zcount++] = slot;
-	focused = slot;
-	return slot;
-}
-
 /* ---- task manager: one window, tabs, auto-refresh ---- */
 
 static void taskmgr_refresh(struct window *w)
 {
 	if (w->tab < 0 || w->tab >= TM_NTABS)
 		w->tab = 0;
+	update_grid_dims(w); /* the Performance tab gives up rows to the graphs */
 	fill_grid_from_cmd(w, tm_tabs[w->tab].cmd);
 	snprintf(w->title, sizeof(w->title), "Task Manager  -  %s", tm_tabs[w->tab].label);
 }
@@ -1030,12 +1069,8 @@ static void fm_click(struct window *w, int y)
 		memcpy(fm->cwd, path, strlen(path) + 1);
 		fm_load(w);
 	} else if (e->isreg) {
-		/* Regular files only: cat on a fifo or char device would block forever. */
-		if (strchr(path, '\''))
-			return; /* refuse to build a shell command we can't quote safely */
-		char cmd[FM_FULLLEN + 16];
-		snprintf(cmd, sizeof(cmd), "cat '%s'", path);
-		spawn_output_window(e->name, cmd);
+		/* Regular files only: opening a fifo or char device would block forever. */
+		spawn_editor(path);
 	}
 }
 
@@ -1092,12 +1127,363 @@ static int spawn_file_window(void)
 	return slot;
 }
 
+/* ---- text editor ---- */
+
+static void ed_render(struct window *w)
+{
+	struct edstate *e = w->ed;
+	if (e->cy < 0) e->cy = 0;
+	if (e->cy >= e->nlines) e->cy = e->nlines - 1;
+	int len = (int)strlen(e->line[e->cy]);
+	if (e->cx > len) e->cx = len;
+	if (e->cx < 0) e->cx = 0;
+	/* keep the caret on screen */
+	if (e->cy < e->scroll) e->scroll = e->cy;
+	if (e->cy >= e->scroll + w->rows) e->scroll = e->cy - w->rows + 1;
+	if (e->scroll < 0) e->scroll = 0;
+
+	for (int r = 0; r < w->rows; r++)
+		clear_row_range(w, r, 0, w->cols - 1);
+	for (int r = 0; r < w->rows; r++) {
+		int i = e->scroll + r;
+		if (i >= e->nlines)
+			break;
+		for (int c = 0; c < w->cols && e->line[i][c]; c++) {
+			w->gch[r][c] = (unsigned char)e->line[i][c];
+			w->gfg[r][c] = COL_FG_DEFAULT;
+		}
+	}
+	w->cur_row = e->cy - e->scroll;
+	w->cur_col = e->cx;
+	if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
+
+	snprintf(w->title, sizeof(w->title), "%s%.400s%s%s",
+		 e->dirty ? "*" : "", e->path,
+		 e->status[0] ? "  -  " : "", e->status);
+}
+
+static void ed_save(struct window *w)
+{
+	struct edstate *e = w->ed;
+	if (e->truncated) {
+		snprintf(e->status, sizeof(e->status), "REFUSED: file was truncated on load");
+		return;
+	}
+	FILE *f = fopen(e->path, "w");
+	if (!f) {
+		snprintf(e->status, sizeof(e->status), "save failed: %s", strerror(errno));
+		return;
+	}
+	for (int i = 0; i < e->nlines; i++)
+		fprintf(f, "%s\n", e->line[i]);
+	if (fclose(f) != 0) {
+		snprintf(e->status, sizeof(e->status), "save failed: %s", strerror(errno));
+		return;
+	}
+	e->dirty = 0;
+	snprintf(e->status, sizeof(e->status), "saved %d lines", e->nlines);
+}
+
+static void ed_insert(struct edstate *e, char c)
+{
+	char *l = e->line[e->cy];
+	int len = (int)strlen(l);
+	if (len + 1 >= ED_MAXCOL)
+		return; /* ponytail: hard line-length cap, no wrapping */
+	memmove(l + e->cx + 1, l + e->cx, len - e->cx + 1);
+	l[e->cx++] = c;
+	e->dirty = 1;
+}
+
+static void ed_newline(struct edstate *e)
+{
+	if (e->nlines + 1 >= ED_MAXLINES)
+		return;
+	for (int i = e->nlines; i > e->cy + 1; i--)
+		memcpy(e->line[i], e->line[i - 1], ED_MAXCOL);
+	char tail[ED_MAXCOL];
+	char *cur = e->line[e->cy];
+	snprintf(tail, sizeof(tail), "%s", cur + e->cx);
+	cur[e->cx] = 0;
+	memcpy(e->line[e->cy + 1], tail, sizeof(tail));
+	e->nlines++;
+	e->cy++;
+	e->cx = 0;
+	e->dirty = 1;
+}
+
+static void ed_backspace(struct edstate *e)
+{
+	char *l = e->line[e->cy];
+	if (e->cx > 0) {
+		int len = (int)strlen(l);
+		memmove(l + e->cx - 1, l + e->cx, len - e->cx + 1);
+		e->cx--;
+		e->dirty = 1;
+		return;
+	}
+	if (e->cy == 0)
+		return;
+	char *prev = e->line[e->cy - 1];
+	int plen = (int)strlen(prev);
+	int llen = (int)strlen(l);
+	if (plen + llen < ED_MAXCOL)
+		memcpy(prev + plen, l, llen + 1);
+	for (int i = e->cy; i < e->nlines - 1; i++)
+		memcpy(e->line[i], e->line[i + 1], ED_MAXCOL);
+	e->nlines--;
+	e->cy--;
+	e->cx = plen;
+	e->dirty = 1;
+}
+
+static int ed_keys(struct window *w, const char *buf, int n)
+{
+	struct edstate *e = w->ed;
+	for (int i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)buf[i];
+		if (c == 0x1b && i + 2 < n && buf[i + 1] == '[') {
+			switch (buf[i + 2]) {
+			case 'A': e->cy--; break;
+			case 'B': e->cy++; break;
+			case 'C': e->cx++; break;
+			case 'D': e->cx--; break;
+			case '5': e->cy -= w->rows - 1; break;
+			case '6': e->cy += w->rows - 1; break;
+			default: break;
+			}
+			if (e->cy < 0) e->cy = 0;
+			if (e->cy >= e->nlines) e->cy = e->nlines - 1;
+			i += 2;
+			continue;
+		}
+		e->status[0] = 0;
+		if (c == 0x13)          ed_save(w);           /* Ctrl+S */
+		else if (c == '\r' || c == '\n') ed_newline(e);
+		else if (c == 0x7f || c == '\b') ed_backspace(e);
+		else if (c == '\t')     { for (int k = 0; k < 4; k++) ed_insert(e, ' '); }
+		else if (c >= 0x20 && c < 0x7f) ed_insert(e, (char)c);
+	}
+	ed_render(w);
+	return 1;
+}
+
+static void ed_click(struct window *w, int x, int y)
+{
+	struct edstate *e = w->ed;
+	int row = (y - (w->y + TITLE_H)) / font_h;
+	int col = (x - (w->x + 4)) / font_w;
+	if (row < 0) row = 0;
+	if (col < 0) col = 0;
+	e->cy = e->scroll + row;
+	e->cx = col;
+	ed_render(w); /* clamps both */
+}
+
+static int spawn_editor(const char *path)
+{
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+	struct edstate *e = calloc(1, sizeof(struct edstate));
+	if (!e)
+		return -1;
+	snprintf(e->path, sizeof(e->path), "%s", path);
+
+	FILE *f = fopen(path, "r");
+	if (f) {
+		char raw[ED_MAXCOL * 4];
+		while (e->nlines < ED_MAXLINES && fgets(raw, sizeof(raw), f)) {
+			raw[strcspn(raw, "\n")] = 0;
+			if (strlen(raw) >= ED_MAXCOL)
+				e->truncated = 1;
+			snprintf(e->line[e->nlines], ED_MAXCOL, "%s", raw);
+			e->nlines++;
+		}
+		/* more lines than we can hold: saving would silently drop the rest */
+		if (e->nlines >= ED_MAXLINES && fgetc(f) != EOF)
+			e->truncated = 1;
+		fclose(f);
+	}
+	if (e->nlines == 0)
+		e->nlines = 1;
+	if (e->truncated)
+		snprintf(e->status, sizeof(e->status), "READ-ONLY: file too large");
+
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_EDIT;
+	wins[slot].pty_fd = -1;
+	wins[slot].ed = e;
+	wins[slot].x = 260 + slot * 24;
+	wins[slot].y = 110 + slot * 24;
+	wins[slot].w = 620;
+	wins[slot].h = 420;
+	wins[slot].attr_fg = COL_FG_DEFAULT;
+	wins[slot].attr_bg = COL_BG_DEFAULT;
+	update_grid_dims(&wins[slot]);
+	ed_render(&wins[slot]);
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+/* ---- settings ---- */
+
+#define SET_BTNW 130
+#define SET_BTNH 30
+
+static int spawn_settings(void)
+{
+	for (int i = 0; i < MAX_WIN; i++) {
+		if (wins[i].used && wins[i].type == WIN_SETTINGS) {
+			wins[i].minimized = 0;
+			raise_window(i);
+			focused = i;
+			return i;
+		}
+	}
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_SETTINGS;
+	wins[slot].pty_fd = -1;
+	wins[slot].x = 260;
+	wins[slot].y = 140;
+	wins[slot].w = 520;
+	wins[slot].h = 300;
+	snprintf(wins[slot].title, sizeof(wins[slot].title), "Settings");
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+static void draw_settings(struct window *w, int content_y)
+{
+	draw_text(w->x + 16, content_y + 14, "Theme", 0xffffff);
+	for (int t = 0; t < NUM_THEMES; t++) {
+		int bx = w->x + 16 + t * (SET_BTNW + 10);
+		int by = content_y + 38;
+		int on = (t == theme_idx);
+		fill_round_rect_grad(bx, by, SET_BTNW, SET_BTNH, 6,
+				     mix(themes[t].dtop, 0xffffff, on ? 40 : 0),
+				     themes[t].dbot);
+		if (on)
+			fill_round_rect(bx, by + SET_BTNH - 3, SET_BTNW, 3, 1, themes[t].accent);
+		fill_circle(bx + 14, by + SET_BTNH / 2, 5, themes[t].accent);
+		draw_text_clip(bx + 26, by + (SET_BTNH - font_h) / 2, themes[t].name,
+			       on ? 0xffffff : 0xa6adc8, SET_BTNW - 32);
+	}
+
+	char info[256];
+	snprintf(info, sizeof(info),
+		 "Display\n  %dx%d  %d bpp\n  font %dx%d (kernel VT)\n"
+		 "\nMode is fixed by GRUB gfxpayload at boot.",
+		 xres, yres, bpp, font_w, font_h);
+	draw_text(w->x + 16, content_y + 90, info, 0x9399b2);
+}
+
+/* Theme button hit-test; returns the clicked theme or -1. */
+static int settings_click(struct window *w, int px, int py)
+{
+	int by = w->y + TITLE_H + 38;
+	if (py < by || py >= by + SET_BTNH)
+		return -1;
+	for (int t = 0; t < NUM_THEMES; t++) {
+		int bx = w->x + 16 + t * (SET_BTNW + 10);
+		if (px >= bx && px < bx + SET_BTNW)
+			return t;
+	}
+	return -1;
+}
+
+/* ---- CPU / memory history ---- */
+
+static long read_meminfo_kb(const char *key)
+{
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f)
+		return 0;
+	char line[128];
+	long val = 0;
+	size_t klen = strlen(key);
+	while (fgets(line, sizeof(line), f)) {
+		if (!strncmp(line, key, klen) && line[klen] == ':') {
+			val = strtol(line + klen + 1, NULL, 10);
+			break;
+		}
+	}
+	fclose(f);
+	return val;
+}
+
+/* Called once a second. Percentages, 0..100. */
+static void sample_stats(void)
+{
+	static long prev_busy, prev_total;
+	int cpu = 0, mem = 0;
+
+	FILE *f = fopen("/proc/stat", "r");
+	if (f) {
+		long v[8] = {0};
+		if (fscanf(f, "cpu %ld %ld %ld %ld %ld %ld %ld %ld",
+			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) >= 4) {
+			long total = 0;
+			for (int i = 0; i < 8; i++)
+				total += v[i];
+			long busy = total - v[3] - v[4]; /* minus idle and iowait */
+			long dt = total - prev_total, db = busy - prev_busy;
+			if (prev_total && dt > 0)
+				cpu = (int)(db * 100 / dt);
+			prev_total = total;
+			prev_busy = busy;
+		}
+		fclose(f);
+	}
+
+	long tot = read_meminfo_kb("MemTotal");
+	long avail = read_meminfo_kb("MemAvailable");
+	if (tot > 0 && avail > 0)
+		mem = (int)((tot - avail) * 100 / tot);
+
+	if (cpu < 0) cpu = 0;
+	if (cpu > 100) cpu = 100;
+	memmove(cpu_hist, cpu_hist + 1, sizeof(cpu_hist) - sizeof(cpu_hist[0]));
+	memmove(mem_hist, mem_hist + 1, sizeof(mem_hist) - sizeof(mem_hist[0]));
+	cpu_hist[HIST - 1] = cpu;
+	mem_hist[HIST - 1] = mem;
+}
+
+static void draw_graph(int x, int y, int w, int h, const int *hist,
+		       uint32_t col, const char *label)
+{
+	fill_round_rect(x, y, w, h, 4, 0x181826);
+	for (int g = 1; g < 4; g++)
+		fill_rect(x + 1, y + g * h / 4, w - 2, 1, 0x272740);
+
+	int bw = w / HIST;
+	if (bw < 1) bw = 1;
+	for (int i = 0; i < HIST; i++) {
+		int bh = hist[i] * (h - 2) / 100;
+		int bx = x + 1 + i * (w - 2) / HIST;
+		if (bh > 0)
+			fill_rect(bx, y + h - 1 - bh, bw, bh, col);
+	}
+
+	char txt[48];
+	snprintf(txt, sizeof(txt), "%s %d%%", label, hist[HIST - 1]);
+	draw_text(x + 8, y + 6, txt, 0xffffff);
+}
+
 /* Small colored dot per window type, drawn in the titlebar. */
 static uint32_t win_accent(const struct window *w)
 {
 	if (w->type == WIN_TERM)  return 0x9333ea;
 	if (w->type == WIN_FILES) return 0x06b6d4;
-	return 0x3b82f6;
+	if (w->type == WIN_EDIT)  return 0xa6e3a1;
+	return themes[theme_idx].accent;
 }
 
 static void draw_window(struct window *w)
@@ -1133,6 +1519,12 @@ static void draw_window(struct window *w)
 	if (content_h < 0)
 		content_h = 0;
 
+	if (w->type == WIN_SETTINGS) {
+		fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
+		draw_settings(w, content_y);
+		return; /* no grid, no resize grip -- settings is a fixed panel */
+	}
+
 	/* task-manager tab strip sits between titlebar and content */
 	if (w->type == WIN_TASKMGR) {
 		int tw = w->w / TM_NTABS;
@@ -1152,6 +1544,15 @@ static void draw_window(struct window *w)
 		}
 		content_y += TM_TABH;
 		content_h -= TM_TABH;
+
+		if (w->tab == 1 && content_h > TM_GRAPH_H) {
+			fill_rect(w->x, content_y, w->w, TM_GRAPH_H, COL_BG_DEFAULT);
+			int gw = (w->w - 24) / 2, gh = TM_GRAPH_H - 16;
+			draw_graph(w->x + 8, content_y + 8, gw, gh, cpu_hist, 0x89b4fa, "CPU");
+			draw_graph(w->x + 16 + gw, content_y + 8, gw, gh, mem_hist, 0xa6e3a1, "MEM");
+			content_y += TM_GRAPH_H;
+			content_h -= TM_GRAPH_H;
+		}
 	}
 
 	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
@@ -1172,7 +1573,7 @@ static void draw_window(struct window *w)
 				blit_char(w->x + 4 + c * font_w, ry, ch, w->gfg[r][c]);
 		}
 	}
-	if (w->type == WIN_TERM) {
+	if (w->type == WIN_TERM || w->type == WIN_EDIT) {
 		int bx = w->x + 4 + w->cur_col * font_w;
 		int by = content_y + w->cur_row * font_h + font_h - 2;
 		fill_rect(bx, by, font_w, 2, 0xf9e2af);
@@ -1189,11 +1590,46 @@ static void draw_window(struct window *w)
 	}
 }
 
+/* "Show desktop": minimize everything, click again to bring it all back.
+ * Sits at the right end of the taskbar, just left of the clock. */
+#define SD_W 34
+
+static int sd_x(void)
+{
+	int clockw = 8 * font_w; /* "hh:mm:ss" */
+	return xres - clockw - 26 - SD_W - 10;
+}
+
+static void toggle_show_desktop(void)
+{
+	if (!sd_active) {
+		for (int i = 0; i < MAX_WIN; i++) {
+			sd_saved[i] = wins[i].used && !wins[i].minimized;
+			if (sd_saved[i])
+				wins[i].minimized = 1;
+		}
+		sd_active = 1;
+	} else {
+		for (int i = 0; i < MAX_WIN; i++)
+			if (sd_saved[i] && wins[i].used)
+				wins[i].minimized = 0;
+		sd_active = 0;
+	}
+}
+
 static void draw_taskbar(void)
 {
 	int ty = yres - TASK_H;
 	fill_vgradient(0, ty, xres, TASK_H, 0x1c1c2a, 0x101018);
 	fill_rect(0, ty, xres, 1, 0x3a3a4d);
+
+	/* show-desktop button: a small stylized screen */
+	int sy = ty + 5, sh = TASK_H - 10, sx = sd_x();
+	fill_round_rect_grad(sx, sy, SD_W, sh, 5,
+			     sd_active ? 0x4a4c63 : 0x2b2b3a,
+			     sd_active ? 0x393b52 : 0x22222e);
+	fill_round_rect(sx + 8, sy + 7, SD_W - 16, sh - 16, 2,
+			sd_active ? themes[theme_idx].accent : 0x9399b2);
 
 	int bx = 8;
 	for (int zi = 0; zi < zcount; zi++) {
@@ -1202,6 +1638,8 @@ static void draw_taskbar(void)
 			continue;
 		int bw = 130, bh = TASK_H - 10;
 		int by = ty + 5;
+		if (bx + bw > sx - 8)
+			break; /* out of room before the show-desktop button */
 		int act = (i == focused && !wins[i].minimized);
 		fill_round_rect_grad(bx, by, bw, bh, 5,
 				     act ? 0x4a4c63 : 0x2b2b3a,
@@ -1255,7 +1693,8 @@ static void cycle_window_focus(void)
 
 static void redraw_all(void)
 {
-	fill_vgradient(0, 0, xres, yres - TASK_H, 0x232338, 0x14141f);
+	fill_vgradient(0, 0, xres, yres - TASK_H,
+		       themes[theme_idx].dtop, themes[theme_idx].dbot);
 	draw_icons();
 	for (int zi = 0; zi < zcount; zi++) {
 		int i = zorder[zi];
@@ -1279,12 +1718,18 @@ static void clamp_window(struct window *w)
 static void do_hit_test(int x, int y)
 {
 	if (y >= yres - TASK_H) {
-		int bx = 4;
+		if (x >= sd_x() && x < sd_x() + SD_W) {
+			toggle_show_desktop();
+			return;
+		}
+		int bx = 8;
 		for (int zi = 0; zi < zcount; zi++) {
 			int i = zorder[zi];
 			if (!wins[i].used)
 				continue;
 			int bw = 130;
+			if (bx + bw > sd_x() - 8)
+				break;
 			if (x >= bx && x < bx + bw) {
 				wins[i].minimized = 0;
 				raise_window(i);
@@ -1332,6 +1777,12 @@ static void do_hit_test(int x, int y)
 				focused = i;
 				if (w->type == WIN_FILES) {
 					fm_click(w, y);
+				} else if (w->type == WIN_EDIT) {
+					ed_click(w, x, y);
+				} else if (w->type == WIN_SETTINGS) {
+					int t = settings_click(w, x, y);
+					if (t >= 0)
+						theme_idx = t;
 				} else if (w->type == WIN_TASKMGR) {
 					int t = taskmgr_tab_at(w, x, y);
 					if (t >= 0 && t != w->tab) {
@@ -1372,6 +1823,8 @@ static void launch_icon(int idx)
 		spawn_file_window();
 	} else if (ic->action == 5) {
 		spawn_taskmgr();
+	} else if (ic->action == 6) {
+		spawn_settings();
 	}
 }
 
@@ -1674,6 +2127,7 @@ int main(void)
 		 * open Task Manager tab refreshes without needing input. */
 		int pr = poll(fds, n, 1000);
 		if (pr == 0) {
+			sample_stats();
 			for (int i = 0; i < MAX_WIN; i++)
 				if (wins[i].used && wins[i].type == WIN_TASKMGR && !wins[i].minimized)
 					taskmgr_refresh(&wins[i]);
@@ -1711,6 +2165,9 @@ int main(void)
 			if (r > 0 && !alt_held && focused >= 0 && wins[focused].used) {
 				if (wins[focused].type == WIN_TERM)
 					write(wins[focused].pty_fd, buf, r);
+				else if (wins[focused].type == WIN_EDIT &&
+					 ed_keys(&wins[focused], buf, r))
+					need_redraw = 1;
 				else if (wins[focused].type == WIN_FILES &&
 					 fm_keys(&wins[focused], buf, r))
 					need_redraw = 1;
