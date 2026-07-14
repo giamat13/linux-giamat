@@ -747,6 +747,8 @@ static void run_and_show(const char *cmd)
 		}
 		pclose(p);
 	}
+	if (backbuf)
+		memcpy(fbp, backbuf, (size_t)line_length * yres);
 }
 
 static void raise_window(int i)
@@ -2335,7 +2337,7 @@ static void launch_icon(int idx)
 	if (ic->action == 1) {
 		run_and_show("echo Rebooting...");
 		usleep(500000);
-		system("reboot");
+		system("reboot -f");
 	} else if (ic->action == 2) {
 		run_and_show("echo Powering off...");
 		usleep(500000);
