@@ -45,8 +45,75 @@
 enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS };
 
 enum glyph {
-	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE
+	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
+	G_IMAGE, G_ARCHIVE, G_CODE
 };
+
+/* File-type classification by extension -- drives the icon/tag/color shown
+ * for a file, both on the desktop and in the File Manager listing. */
+enum fcat { FCAT_DIR, FCAT_IMAGE, FCAT_ARCHIVE, FCAT_CODE, FCAT_TEXT, FCAT_OTHER };
+
+static enum fcat classify_file(const char *name, int isdir)
+{
+	if (isdir)
+		return FCAT_DIR;
+	const char *dot = strrchr(name, '.');
+	if (!dot || !dot[1])
+		return FCAT_OTHER;
+	char ext[8];
+	int i;
+	for (i = 0; dot[1 + i] && i < 7; i++)
+		ext[i] = (char)tolower((unsigned char)dot[1 + i]);
+	ext[i] = 0;
+	if (!strcmp(ext, "png") || !strcmp(ext, "jpg") || !strcmp(ext, "jpeg") ||
+	    !strcmp(ext, "gif") || !strcmp(ext, "bmp") || !strcmp(ext, "svg"))
+		return FCAT_IMAGE;
+	if (!strcmp(ext, "zip") || !strcmp(ext, "tar") || !strcmp(ext, "gz") ||
+	    !strcmp(ext, "xz") || !strcmp(ext, "bz2") || !strcmp(ext, "tgz"))
+		return FCAT_ARCHIVE;
+	if (!strcmp(ext, "sh") || !strcmp(ext, "c") || !strcmp(ext, "h") ||
+	    !strcmp(ext, "py") || !strcmp(ext, "js") || !strcmp(ext, "pl"))
+		return FCAT_CODE;
+	if (!strcmp(ext, "txt") || !strcmp(ext, "md") || !strcmp(ext, "log") ||
+	    !strcmp(ext, "conf") || !strcmp(ext, "cfg"))
+		return FCAT_TEXT;
+	return FCAT_OTHER;
+}
+
+static uint32_t fcat_color(enum fcat c)
+{
+	switch (c) {
+	case FCAT_DIR:     return 0x89b4fa;
+	case FCAT_IMAGE:   return 0xf9a825;
+	case FCAT_ARCHIVE: return 0xa0785a;
+	case FCAT_CODE:    return 0x22c55e;
+	default:           return 0x94a3b8; /* TEXT and OTHER: same neutral as before */
+	}
+}
+
+static int fcat_glyph(enum fcat c)
+{
+	switch (c) {
+	case FCAT_DIR:     return G_FOLDER;
+	case FCAT_IMAGE:   return G_IMAGE;
+	case FCAT_ARCHIVE: return G_ARCHIVE;
+	case FCAT_CODE:    return G_CODE;
+	default:           return G_FILE;
+	}
+}
+
+/* 5-char tag shown in the File Manager listing, same width as "[DIR]". */
+static const char *fcat_tag(enum fcat c)
+{
+	switch (c) {
+	case FCAT_DIR:     return "[DIR]";
+	case FCAT_IMAGE:   return "[IMG]";
+	case FCAT_ARCHIVE: return "[ZIP]";
+	case FCAT_CODE:    return "[SRC]";
+	case FCAT_TEXT:    return "[TXT]";
+	default:           return "     ";
+	}
+}
 
 struct icon {
 	const char *label;
@@ -500,6 +567,27 @@ static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_rect(cx - 9, cy + 4, 18, 3, hole);
 		fill_rect(cx - 9, cy + 12, 12, 3, hole);
 		break;
+	case G_IMAGE:
+		/* a photo frame with a mountain scene and a sun */
+		fill_round_rect(cx - 18, cy - 14, 36, 28, 3, fg);
+		fill_round_rect(cx - 14, cy - 10, 28, 20, 1, hole);
+		fill_circle(cx + 5, cy - 4, 3, fg);
+		fill_triangle(cx - 8, cy + 6, 6, 0, fg);
+		fill_triangle(cx + 1, cy + 6, 8, 0, fg);
+		break;
+	case G_ARCHIVE:
+		/* a packed box with a carrying strap */
+		fill_round_rect(cx - 16, cy - 14, 32, 28, 3, fg);
+		fill_rect(cx - 16, cy - 4, 32, 4, hole);
+		fill_round_rect(cx - 4, cy - 9, 8, 6, 1, hole);
+		break;
+	case G_CODE:
+		/* a document with a "< >" mark carved out */
+		fill_round_rect(cx - 16, cy - 20, 32, 40, 3, fg);
+		fill_triangle(cx - 5, cy - 2, 5, 2, hole);
+		fill_triangle(cx + 5, cy - 2, 5, 3, hole);
+		fill_rect(cx - 9, cy + 10, 18, 3, hole);
+		break;
 	default:
 		break;
 	}
@@ -566,13 +654,14 @@ static void draw_icons(void)
 		int combined = NUM_ICONS + i;
 		int lifted = (icon_press == combined && icon_dragged);
 		int tx = x + (ICON_W - TILE) / 2, ty = y;
-		uint32_t c = df->isdir ? 0x89b4fa : 0x94a3b8;
+		enum fcat cat = classify_file(df->name, df->isdir);
+		uint32_t c = fcat_color(cat);
 
 		fill_round_rect(tx + 2, ty + (lifted ? 7 : 4), TILE, TILE, 18, 0x0c0c14);
 		fill_round_rect_grad(tx, ty, TILE, TILE, 18,
 				     mix(c, 0xffffff, lifted ? 75 : 40),
 				     mix(c, 0x000000, 55));
-		draw_glyph(df->isdir ? G_FOLDER : G_FILE, tx + TILE / 2, ty + TILE / 2,
+		draw_glyph(fcat_glyph(cat), tx + TILE / 2, ty + TILE / 2,
 			   0xffffff, mix(c, 0x000000, 78));
 		draw_text_clip(x, ty + TILE + 9, df->name, 0xdfe4f2, ICON_W);
 	}
@@ -1151,15 +1240,18 @@ static void fm_render(struct window *w)
 			break;
 		int i = fm->view[vi];
 		struct fent *e = &fm->ents[i];
+		enum fcat cat = classify_file(e->name, e->isdir);
 		char line[FM_NAMELEN + 16];
-		snprintf(line, sizeof(line), "%s %s", e->isdir ? "[DIR]" : "     ", e->name);
-		/* Hidden files appear dimmed (starts with .) */
+		snprintf(line, sizeof(line), "%s %s", fcat_tag(cat), e->name);
+		/* Hidden files appear dimmed (starts with .); otherwise images,
+		 * archives, code, and directories get their category color --
+		 * plain text/unrecognized files keep the normal foreground. */
 		int is_hidden = (e->name[0] == '.');
 		uint32_t color;
 		if (is_hidden)
-			color = 0x6c7086;  /* dimmed gray */
-		else if (e->isdir)
-			color = 0x89b4fa;  /* blue */
+			color = 0x6c7086;
+		else if (cat == FCAT_IMAGE || cat == FCAT_ARCHIVE || cat == FCAT_CODE || cat == FCAT_DIR)
+			color = fcat_color(cat);
 		else
 			color = COL_FG_DEFAULT;
 		fm_puts(w, r, 0, line, color);
@@ -1287,6 +1379,13 @@ static void fm_create(struct window *w)
 		fm->prompt = 0;
 		return;
 	}
+	/* Every file this app creates should carry an extension, so its type
+	 * icon/tag is always known -- directories have no such concept. */
+	if (fm->prompt == 1 && !strchr(fm->pbuf, '.')) {
+		size_t len = strlen(fm->pbuf);
+		if (len + 4 < sizeof(fm->pbuf))
+			memcpy(fm->pbuf + len, ".txt", 5);
+	}
 	char path[FM_FULLLEN];
 	fm_path(fm, fm->pbuf, path, sizeof(path));
 	int ok;
@@ -1321,6 +1420,12 @@ static void fm_rename(struct window *w)
 		return;
 	}
 	struct fent *e = &fm->ents[fm->sel];
+	/* Renaming a file shouldn't be able to strip its extension away. */
+	if (!e->isdir && !strchr(fm->pbuf, '.')) {
+		size_t len = strlen(fm->pbuf);
+		if (len + 4 < sizeof(fm->pbuf))
+			memcpy(fm->pbuf + len, ".txt", 5);
+	}
 	char oldpath[FM_FULLLEN], newpath[FM_FULLLEN];
 	fm_path(fm, e->name, oldpath, sizeof(oldpath));
 	fm_path(fm, fm->pbuf, newpath, sizeof(newpath));
