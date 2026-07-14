@@ -125,7 +125,18 @@ struct fmstate {
 	struct fent ents[FM_MAXENT];
 	int count;
 	int scroll;
+	int sel;          /* selected row, -1 = none */
+	int prompt;       /* 0 none, 1 new file, 2 new folder */
+	char pbuf[FM_NAMELEN];
+	int confirm_del;  /* Delete was armed: the next click actually deletes */
+	char status[64];
 };
+
+/* File-manager toolbar, drawn between titlebar and listing. */
+#define FM_TOOLH 28
+#define FM_NBTN 4
+static const char *fm_btns[FM_NBTN] = { "New File", "New Dir", "Delete", "Refresh" };
+#define FM_BTNW 96
 
 /* Text editor state, allocated only for WIN_EDIT windows. */
 #define ED_MAXLINES 1024
@@ -492,6 +503,8 @@ static int icon_at(int px, int py)
 static void update_grid_dims(struct window *w)
 {
 	int content_h = w->h - TITLE_H;
+	if (w->type == WIN_FILES)
+		content_h -= FM_TOOLH;
 	if (w->type == WIN_TASKMGR) {
 		content_h -= TM_TABH;
 		if (w->tab == 1)
@@ -974,6 +987,9 @@ static void fm_render(struct window *w)
 			if (col > (int)strlen(line) + 1)
 				fm_puts(w, r, col, sz, 0x6c7086);
 		}
+		if (i == fm->sel)
+			for (int c = 0; c < w->cols; c++)
+				w->gbg[r][c] = 0x313244;
 	}
 }
 
@@ -996,6 +1012,8 @@ static void fm_load(struct window *w)
 	struct fmstate *fm = w->fm;
 	fm->count = 0;
 	fm->scroll = 0;
+	fm->sel = -1;
+	fm->confirm_del = 0;
 
 	if (strcmp(fm->cwd, "/") != 0) {
 		snprintf(fm->ents[0].name, FM_NAMELEN, "..");
@@ -1038,15 +1056,122 @@ static void fm_load(struct window *w)
 	fm_render(w);
 }
 
-static void fm_click(struct window *w, int y)
+/* Toolbar hit-test: returns button index or -1. */
+static int fm_btn_at(struct window *w, int px, int py)
+{
+	int by = w->y + TITLE_H;
+	if (py < by || py >= by + FM_TOOLH)
+		return -1;
+	int idx = (px - w->x - 6) / (FM_BTNW + 4);
+	if (idx < 0 || idx >= FM_NBTN)
+		return -1;
+	return idx;
+}
+
+/* Delete the selected entry. Files are unlinked, directories must be empty. */
+static void fm_delete(struct window *w)
 {
 	struct fmstate *fm = w->fm;
-	int row = (y - (w->y + TITLE_H)) / font_h;
+	if (fm->sel < 0 || fm->sel >= fm->count) {
+		snprintf(fm->status, sizeof(fm->status), "select something first");
+		return;
+	}
+	struct fent *e = &fm->ents[fm->sel];
+	if (!strcmp(e->name, "..")) {
+		snprintf(fm->status, sizeof(fm->status), "cannot delete ..");
+		return;
+	}
+	char path[FM_FULLLEN];
+	fm_path(fm, e->name, path, sizeof(path));
+	int r = e->isdir ? rmdir(path) : unlink(path);
+	if (r != 0)
+		snprintf(fm->status, sizeof(fm->status), "delete failed: %s", strerror(errno));
+	else
+		snprintf(fm->status, sizeof(fm->status), "deleted %s", e->name);
+	fm_load(w);
+}
+
+/* Create whatever the prompt was asking for, named by fm->pbuf. */
+static void fm_create(struct window *w)
+{
+	struct fmstate *fm = w->fm;
+	if (!fm->pbuf[0] || strchr(fm->pbuf, '/')) {
+		snprintf(fm->status, sizeof(fm->status), "bad name");
+		fm->prompt = 0;
+		return;
+	}
+	char path[FM_FULLLEN];
+	fm_path(fm, fm->pbuf, path, sizeof(path));
+	int ok;
+	if (fm->prompt == 2) {
+		ok = mkdir(path, 0755) == 0;
+	} else {
+		int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		ok = fd >= 0;
+		if (fd >= 0)
+			close(fd);
+	}
+	if (!ok)
+		snprintf(fm->status, sizeof(fm->status), "create failed: %s", strerror(errno));
+	else
+		snprintf(fm->status, sizeof(fm->status), "created %s", fm->pbuf);
+	fm->prompt = 0;
+	fm->pbuf[0] = 0;
+	fm_load(w);
+}
+
+static void fm_toolbar(struct window *w, int btn)
+{
+	struct fmstate *fm = w->fm;
+	fm->status[0] = 0;
+	if (btn != 2)
+		fm->confirm_del = 0;
+	switch (btn) {
+	case 0:
+	case 1:
+		fm->prompt = btn == 0 ? 1 : 2;
+		fm->pbuf[0] = 0;
+		break;
+	case 2:
+		/* Deleting is irreversible: the first click only arms the button. */
+		if (!fm->confirm_del) {
+			fm->confirm_del = 1;
+			snprintf(fm->status, sizeof(fm->status), "click Delete again to confirm");
+		} else {
+			fm->confirm_del = 0;
+			fm_delete(w);
+		}
+		break;
+	case 3:
+		fm_load(w);
+		break;
+	}
+}
+
+static void fm_click(struct window *w, int x, int y)
+{
+	struct fmstate *fm = w->fm;
+	int btn = fm_btn_at(w, x, y);
+	if (btn >= 0) {
+		fm_toolbar(w, btn);
+		fm_render(w);
+		return;
+	}
+	fm->status[0] = 0;
+	fm->confirm_del = 0;
+
+	int row = (y - (w->y + TITLE_H + FM_TOOLH)) / font_h;
 	if (row < 0 || row >= w->rows)
 		return;
 	int i = fm->scroll + row;
 	if (i < 0 || i >= fm->count)
 		return;
+	/* First click selects (so Delete has a target), a second one opens it. */
+	if (fm->sel != i) {
+		fm->sel = i;
+		fm_render(w);
+		return;
+	}
 	struct fent *e = &fm->ents[i];
 
 	if (!strcmp(e->name, "..")) {
@@ -1074,11 +1199,36 @@ static void fm_click(struct window *w, int y)
 	}
 }
 
-/* Arrow / PageUp / PageDown scroll the listing. */
+/* While a New File / New Dir prompt is open, keys go into the name field.
+ * Otherwise arrows / PageUp / PageDown scroll the listing. */
 static int fm_keys(struct window *w, const char *buf, int n)
 {
 	struct fmstate *fm = w->fm;
 	int changed = 0;
+
+	if (fm->prompt) {
+		for (int i = 0; i < n; i++) {
+			unsigned char c = (unsigned char)buf[i];
+			int len = (int)strlen(fm->pbuf);
+			if (c == '\r' || c == '\n') {
+				fm_create(w);
+			} else if (c == 0x1b) {
+				fm->prompt = 0;
+				fm->pbuf[0] = 0;
+			} else if ((c == 0x7f || c == '\b') && len > 0) {
+				fm->pbuf[len - 1] = 0;
+			} else if (c >= 0x20 && c < 0x7f && len < FM_NAMELEN - 1) {
+				fm->pbuf[len] = (char)c;
+				fm->pbuf[len + 1] = 0;
+			}
+			changed = 1;
+			if (!fm->prompt)
+				break; /* Enter/Esc ended it; the rest isn't ours */
+		}
+		fm_render(w);
+		return changed;
+	}
+
 	for (int i = 0; i + 2 < n; i++) {
 		if (buf[i] != 0x1b || buf[i + 1] != '[')
 			continue;
@@ -1525,6 +1675,36 @@ static void draw_window(struct window *w)
 		return; /* no grid, no resize grip -- settings is a fixed panel */
 	}
 
+	/* file-manager toolbar sits between titlebar and listing */
+	if (w->type == WIN_FILES && w->fm) {
+		struct fmstate *fm = w->fm;
+		fill_rect(w->x, content_y, w->w, FM_TOOLH, 0x181826);
+		for (int b = 0; b < FM_NBTN; b++) {
+			int bx = w->x + 6 + b * (FM_BTNW + 4);
+			int armed = (b == 2 && fm->confirm_del);
+			fill_round_rect_grad(bx, content_y + 3, FM_BTNW, FM_TOOLH - 6, 4,
+					     armed ? 0xf38ba8 : 0x2b2b3a,
+					     armed ? 0xc4506a : 0x22222e);
+			int lw = (int)strlen(fm_btns[b]) * font_w;
+			draw_text_clip(bx + (FM_BTNW - lw) / 2,
+				       content_y + (FM_TOOLH - font_h) / 2,
+				       fm_btns[b], 0xdfe4f2, FM_BTNW - 6);
+		}
+		/* name prompt / status share the strip to the right of the buttons */
+		int tx = w->x + 6 + FM_NBTN * (FM_BTNW + 4) + 6;
+		int ty2 = content_y + (FM_TOOLH - font_h) / 2;
+		if (fm->prompt) {
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "%s: %s_",
+				 fm->prompt == 2 ? "dir" : "file", fm->pbuf);
+			draw_text_clip(tx, ty2, line, 0xf9e2af, w->x + w->w - tx - 6);
+		} else if (fm->status[0]) {
+			draw_text_clip(tx, ty2, fm->status, 0x9399b2, w->x + w->w - tx - 6);
+		}
+		content_y += FM_TOOLH;
+		content_h -= FM_TOOLH;
+	}
+
 	/* task-manager tab strip sits between titlebar and content */
 	if (w->type == WIN_TASKMGR) {
 		int tw = w->w / TM_NTABS;
@@ -1591,13 +1771,18 @@ static void draw_window(struct window *w)
 }
 
 /* "Show desktop": minimize everything, click again to bring it all back.
- * Sits at the right end of the taskbar, just left of the clock. */
+ * Sits at the far right of the taskbar, to the right of the clock. */
 #define SD_W 34
 
 static int sd_x(void)
 {
-	int clockw = 8 * font_w; /* "hh:mm:ss" */
-	return xres - clockw - 26 - SD_W - 10;
+	return xres - SD_W - 6;
+}
+
+/* Rightmost pixel the window buttons may use: clock and button come after. */
+static int task_limit(void)
+{
+	return sd_x() - 12 - 8 * font_w - 20;
 }
 
 static void toggle_show_desktop(void)
@@ -1638,8 +1823,8 @@ static void draw_taskbar(void)
 			continue;
 		int bw = 130, bh = TASK_H - 10;
 		int by = ty + 5;
-		if (bx + bw > sx - 8)
-			break; /* out of room before the show-desktop button */
+		if (bx + bw > task_limit())
+			break; /* out of room before the clock */
 		int act = (i == focused && !wins[i].minimized);
 		fill_round_rect_grad(bx, by, bw, bh, 5,
 				     act ? 0x4a4c63 : 0x2b2b3a,
@@ -1658,8 +1843,9 @@ static void draw_taskbar(void)
 	struct tm *tm = localtime(&t);
 	snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
 	int tw = (int)strlen(timebuf) * font_w;
-	fill_rect(xres - tw - 26, ty + 9, 1, TASK_H - 18, 0x3a3a4d);
-	draw_text(xres - tw - 14, ty + (TASK_H - font_h) / 2, timebuf, 0xcdd6f4);
+	int cx = sx - 12 - tw; /* clock sits left of the show-desktop button */
+	fill_rect(cx - 12, ty + 9, 1, TASK_H - 18, 0x3a3a4d);
+	draw_text(cx, ty + (TASK_H - font_h) / 2, timebuf, 0xcdd6f4);
 }
 
 static void cycle_window_focus(void)
@@ -1728,7 +1914,7 @@ static void do_hit_test(int x, int y)
 			if (!wins[i].used)
 				continue;
 			int bw = 130;
-			if (bx + bw > sd_x() - 8)
+			if (bx + bw > task_limit())
 				break;
 			if (x >= bx && x < bx + bw) {
 				wins[i].minimized = 0;
@@ -1776,7 +1962,7 @@ static void do_hit_test(int x, int y)
 				raise_window(i);
 				focused = i;
 				if (w->type == WIN_FILES) {
-					fm_click(w, y);
+					fm_click(w, x, y);
 				} else if (w->type == WIN_EDIT) {
 					ed_click(w, x, y);
 				} else if (w->type == WIN_SETTINGS) {
