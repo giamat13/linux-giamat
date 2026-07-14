@@ -46,20 +46,23 @@ enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTI
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
-	G_IMAGE, G_ARCHIVE, G_CODE
+	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC
 };
 
 /* File-type classification by extension -- drives the icon/tag/color shown
- * for a file, both on the desktop and in the File Manager listing. */
-enum fcat { FCAT_DIR, FCAT_IMAGE, FCAT_ARCHIVE, FCAT_CODE, FCAT_TEXT, FCAT_OTHER };
+ * for a file, both on the desktop and in the File Manager listing.
+ * FCAT_EXEC covers extensionless system binaries (busybox, /init, and the
+ * whole /bin, /sbin symlink farm): without it they'd be indistinguishable
+ * from any other extensionless file under FCAT_OTHER. */
+enum fcat { FCAT_DIR, FCAT_IMAGE, FCAT_ARCHIVE, FCAT_CODE, FCAT_TEXT, FCAT_EXEC, FCAT_OTHER };
 
-static enum fcat classify_file(const char *name, int isdir)
+static enum fcat classify_file(const char *name, int isdir, int isexec)
 {
 	if (isdir)
 		return FCAT_DIR;
 	const char *dot = strrchr(name, '.');
 	if (!dot || !dot[1])
-		return FCAT_OTHER;
+		return isexec ? FCAT_EXEC : FCAT_OTHER;
 	char ext[8];
 	int i;
 	for (i = 0; dot[1 + i] && i < 7; i++)
@@ -77,7 +80,7 @@ static enum fcat classify_file(const char *name, int isdir)
 	if (!strcmp(ext, "txt") || !strcmp(ext, "md") || !strcmp(ext, "log") ||
 	    !strcmp(ext, "conf") || !strcmp(ext, "cfg"))
 		return FCAT_TEXT;
-	return FCAT_OTHER;
+	return isexec ? FCAT_EXEC : FCAT_OTHER;
 }
 
 static uint32_t fcat_color(enum fcat c)
@@ -87,6 +90,7 @@ static uint32_t fcat_color(enum fcat c)
 	case FCAT_IMAGE:   return 0xf9a825;
 	case FCAT_ARCHIVE: return 0xa0785a;
 	case FCAT_CODE:    return 0x22c55e;
+	case FCAT_EXEC:    return 0xf43f5e;
 	default:           return 0x94a3b8; /* TEXT and OTHER: same neutral as before */
 	}
 }
@@ -98,6 +102,7 @@ static int fcat_glyph(enum fcat c)
 	case FCAT_IMAGE:   return G_IMAGE;
 	case FCAT_ARCHIVE: return G_ARCHIVE;
 	case FCAT_CODE:    return G_CODE;
+	case FCAT_EXEC:    return G_EXEC;
 	default:           return G_FILE;
 	}
 }
@@ -111,6 +116,7 @@ static const char *fcat_tag(enum fcat c)
 	case FCAT_ARCHIVE: return "[ZIP]";
 	case FCAT_CODE:    return "[SRC]";
 	case FCAT_TEXT:    return "[TXT]";
+	case FCAT_EXEC:    return "[BIN]";
 	default:           return "     ";
 	}
 }
@@ -214,6 +220,7 @@ static int clip_mode;
 struct deskfile {
 	char name[FM_NAMELEN];
 	int isdir;
+	int isexec;
 };
 static struct deskfile desk_files[DESK_MAXFILES];
 static int desk_count;
@@ -232,6 +239,7 @@ struct fent {
 	char name[FM_NAMELEN];
 	int isdir;
 	int isreg;
+	int isexec;
 	long size;
 };
 
@@ -588,6 +596,11 @@ static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_triangle(cx + 5, cy - 2, 5, 3, hole);
 		fill_rect(cx - 9, cy + 10, 18, 3, hole);
 		break;
+	case G_EXEC:
+		/* a rounded "chip" body with a play/run triangle at its center */
+		fill_round_rect(cx - 18, cy - 16, 36, 32, 6, fg);
+		fill_triangle(cx - 4, cy, 9, 3, hole);
+		break;
 	default:
 		break;
 	}
@@ -654,7 +667,7 @@ static void draw_icons(void)
 		int combined = NUM_ICONS + i;
 		int lifted = (icon_press == combined && icon_dragged);
 		int tx = x + (ICON_W - TILE) / 2, ty = y;
-		enum fcat cat = classify_file(df->name, df->isdir);
+		enum fcat cat = classify_file(df->name, df->isdir, df->isexec);
 		uint32_t c = fcat_color(cat);
 
 		fill_round_rect(tx + 2, ty + (lifted ? 7 : 4), TILE, TILE, 18, 0x0c0c14);
@@ -713,7 +726,12 @@ static void desk_scan(void)
 		char path[FM_FULLLEN];
 		snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, e->name);
 		struct stat st;
-		e->isdir = (stat(path, &st) == 0) && S_ISDIR(st.st_mode);
+		if (stat(path, &st) == 0) {
+			e->isdir = S_ISDIR(st.st_mode);
+			e->isexec = (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+		} else {
+			e->isdir = e->isexec = 0;
+		}
 		desk_count++;
 	}
 	closedir(d);
@@ -1240,20 +1258,20 @@ static void fm_render(struct window *w)
 			break;
 		int i = fm->view[vi];
 		struct fent *e = &fm->ents[i];
-		enum fcat cat = classify_file(e->name, e->isdir);
+		enum fcat cat = classify_file(e->name, e->isdir, e->isexec);
 		char line[FM_NAMELEN + 16];
 		snprintf(line, sizeof(line), "%s %s", fcat_tag(cat), e->name);
 		/* Hidden files appear dimmed (starts with .); otherwise images,
-		 * archives, code, and directories get their category color --
-		 * plain text/unrecognized files keep the normal foreground. */
+		 * archives, code, executables, and directories get their category
+		 * color -- plain text/unrecognized files keep the normal foreground. */
 		int is_hidden = (e->name[0] == '.');
 		uint32_t color;
 		if (is_hidden)
 			color = 0x6c7086;
-		else if (cat == FCAT_IMAGE || cat == FCAT_ARCHIVE || cat == FCAT_CODE || cat == FCAT_DIR)
-			color = fcat_color(cat);
-		else
+		else if (cat == FCAT_TEXT || cat == FCAT_OTHER)
 			color = COL_FG_DEFAULT;
+		else
+			color = fcat_color(cat);
 		fm_puts(w, r, 0, line, color);
 		if (e->isreg) {
 			char sz[24];
@@ -1319,9 +1337,10 @@ static void fm_load(struct window *w)
 			if (stat(path, &st) == 0) {
 				e->isdir = S_ISDIR(st.st_mode);
 				e->isreg = S_ISREG(st.st_mode);
+				e->isexec = (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
 				e->size = (long)st.st_size;
 			} else {
-				e->isdir = e->isreg = 0;
+				e->isdir = e->isreg = e->isexec = 0;
 				e->size = 0;
 			}
 			fm->count++;
