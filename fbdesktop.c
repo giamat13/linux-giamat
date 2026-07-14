@@ -46,7 +46,7 @@ enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTI
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
-	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC
+	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC, G_GLOBE
 };
 
 /* File-type classification by extension -- drives the icon/tag/color shown
@@ -125,7 +125,7 @@ struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings */
+	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings,7=cmd in a terminal window */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
@@ -134,6 +134,7 @@ static struct icon icons[] = {
 	{"TASK MGR",  NULL, 0x3b82f6, 5, G_GAUGE},
 	{"FILES",     NULL, 0x06b6d4, 4, G_FOLDER},
 	{"TERMINAL",  NULL, 0x9333ea, 3, G_TERM},
+	{"BROWSER",   "lynx https://lite.duckduckgo.com/lite/", 0x0ea5e9, 7, G_GLOBE},
 	{"SETTINGS",  NULL, 0x64748b, 6, G_GEAR},
 	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
 	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
@@ -555,6 +556,14 @@ static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_ring(cx, cy + 3, 16, 6, fg);
 		fill_rect(cx - 5, cy - 16, 10, 12, hole);  /* gap at the top */
 		fill_round_rect(cx - 2, cy - 18, 5, 18, 2, fg);
+		break;
+	case G_GLOBE:
+		/* meridian + equator inside a ring -- reads as "web" */
+		fill_ring(cx, cy, 19, 4, fg);
+		fill_ring(cx, cy, 9, 3, fg);         /* the meridian, seen edge-on */
+		fill_rect(cx - 16, cy - 8, 32, 3, fg);
+		fill_rect(cx - 18, cy - 1, 36, 3, fg);
+		fill_rect(cx - 16, cy + 6, 32, 3, fg);
 		break;
 	case G_GEAR:
 		/* four teeth + body + hub */
@@ -1046,7 +1055,9 @@ static int alloc_window_slot(void)
 	return -1;
 }
 
-static int spawn_terminal(void)
+/* Backs a window with a pty. `cmd` NULL runs an interactive shell; otherwise it
+ * is handed to sh -c, which is how the browser icon reuses the VT100 grid. */
+static int spawn_terminal(const char *cmd, const char *title)
 {
 	int slot = alloc_window_slot();
 	if (slot < 0)
@@ -1085,7 +1096,10 @@ static int spawn_terminal(void)
 			if (i != slot && wins[i].used && wins[i].type == WIN_TERM)
 				close(wins[i].pty_fd);
 		setenv("TERM", "linux", 1);
-		execl("/bin/sh", "sh", NULL);
+		if (cmd)
+			execl("/bin/sh", "sh", "-c", cmd, NULL);
+		else
+			execl("/bin/sh", "sh", NULL);
 		_exit(1);
 	} else if (pid < 0) {
 		close(master);
@@ -1099,11 +1113,15 @@ static int spawn_terminal(void)
 	wins[slot].pid = pid;
 	wins[slot].x = 200 + slot * 24;
 	wins[slot].y = 120 + slot * 24;
-	wins[slot].w = 560;
-	wins[slot].h = 360;
+	/* A page of text needs more columns than a shell prompt does. */
+	wins[slot].w = cmd ? 820 : 560;
+	wins[slot].h = cmd ? 560 : 360;
 	wins[slot].attr_fg = COL_FG_DEFAULT;
 	wins[slot].attr_bg = COL_BG_DEFAULT;
-	snprintf(wins[slot].title, sizeof(wins[slot].title), "Terminal %d", slot + 1);
+	if (title)
+		snprintf(wins[slot].title, sizeof(wins[slot].title), "%s", title);
+	else
+		snprintf(wins[slot].title, sizeof(wins[slot].title), "Terminal %d", slot + 1);
 	update_grid_dims(&wins[slot]);
 	for (int r = 0; r < wins[slot].rows; r++)
 		clear_row_range(&wins[slot], r, 0, wins[slot].cols - 1);
@@ -2889,7 +2907,9 @@ static void launch_icon(int idx)
 		usleep(500000);
 		system("poweroff -f");
 	} else if (ic->action == 3) {
-		spawn_terminal();
+		spawn_terminal(NULL, NULL);
+	} else if (ic->action == 7) {
+		spawn_terminal(ic->cmd, "Browser");
 	} else if (ic->action == 4) {
 		spawn_file_window();
 	} else if (ic->action == 5) {
