@@ -5,7 +5,8 @@ rm -rf "$ROOT"
 mkdir -p "$ROOT"/{bin,sbin,etc,proc,sys,dev,tmp,root}
 cp /bin/busybox "$ROOT/bin/busybox"
 cd "$ROOT/bin"
-for cmd in sh ls cat mount ps mkdir echo uname clear ln df free dmesg reboot poweroff; do
+for cmd in sh ls cat mount ps mkdir echo uname clear ln df free dmesg reboot poweroff \
+           head tail grep sort uptime wc cut date kill sleep; do
 	ln -sf busybox "$cmd"
 done
 

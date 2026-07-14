@@ -41,33 +41,44 @@
 #define COL_FG_DEFAULT 0xcdd6f4
 #define COL_BG_DEFAULT 0x1e1e2e
 
-enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES };
+enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR };
 
 enum glyph {
-	G_GEAR, G_LIST, G_DISK, G_CHIP, G_DOC, G_FOLDER, G_TERM, G_REFRESH, G_POWER
+	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER
 };
 
 struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 0=output window, 1=reboot, 2=poweroff, 3=terminal, 4=file manager */
+	int action; /* 1=reboot,2=poweroff,3=terminal,4=file manager,5=task manager */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
 
 static struct icon icons[] = {
-	{"SYSTEM",    "uname -a; echo; cat /proc/uptime; echo; cat /proc/version", 0x3b82f6, 0, G_GEAR},
-	{"PROCESSES", "ps aux", 0x22c55e, 0, G_LIST},
-	{"DISK",      "df -h", 0xeab308, 0, G_DISK},
-	{"MEMORY",    "free -m", 0xf97316, 0, G_CHIP},
-	{"DMESG",     "dmesg | tail -40", 0x14b8a6, 0, G_DOC},
+	{"TASK MGR",  NULL, 0x3b82f6, 5, G_GAUGE},
 	{"FILES",     NULL, 0x06b6d4, 4, G_FOLDER},
 	{"TERMINAL",  NULL, 0x9333ea, 3, G_TERM},
 	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
 	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
 };
 #define NUM_ICONS (int)(sizeof(icons)/sizeof(icons[0]))
+
+/* Task Manager tabs -- one window, Windows-style, auto-refreshing. */
+struct tmtab {
+	const char *label;
+	const char *cmd;
+};
+static const struct tmtab tm_tabs[] = {
+	{"Processes",   "ps"},
+	{"Performance", "free -m; echo; head -8 /proc/meminfo; echo; uptime"},
+	{"Disk",        "df -h"},
+	{"System",      "uname -a; echo; uptime; echo; head -1 /proc/version"},
+	{"Dmesg",       "dmesg | tail -40"},
+};
+#define TM_NTABS (int)(sizeof(tm_tabs)/sizeof(tm_tabs[0]))
+#define TM_TABH 26
 
 /* icon drag state: press selects, movement past a threshold turns it into a
  * drag, release without movement launches. */
@@ -107,6 +118,7 @@ struct window {
 	int pty_fd;
 	pid_t pid;
 	struct fmstate *fm; /* WIN_FILES only */
+	int tab;            /* WIN_TASKMGR: active tab */
 
 	int cols, rows;
 	unsigned char gch[GRID_MAXROWS][GRID_MAXCOLS];
@@ -333,50 +345,12 @@ static void draw_text_clip(int x, int y, const char *s, uint32_t fg, int maxw)
 static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 {
 	switch (g) {
-	case G_GEAR:
-		/* four axis teeth + four diagonal teeth, then the hub */
-		fill_round_rect(cx - 5,  cy - 23, 10, 12, 2, fg);
-		fill_round_rect(cx - 5,  cy + 11, 10, 12, 2, fg);
-		fill_round_rect(cx - 23, cy - 5,  12, 10, 2, fg);
-		fill_round_rect(cx + 11, cy - 5,  12, 10, 2, fg);
-		fill_round_rect(cx - 18, cy - 18, 11, 11, 2, fg);
-		fill_round_rect(cx + 7,  cy - 18, 11, 11, 2, fg);
-		fill_round_rect(cx - 18, cy + 7,  11, 11, 2, fg);
-		fill_round_rect(cx + 7,  cy + 7,  11, 11, 2, fg);
-		fill_circle(cx, cy, 16, fg);
-		fill_circle(cx, cy, 6, hole);
-		break;
-	case G_LIST:
-		for (int i = 0; i < 3; i++) {
-			int ry = cy - 14 + i * 12;
-			static const int wds[3] = {26, 20, 24};
-			fill_circle(cx - 16, ry + 3, 3, fg);
-			fill_round_rect(cx - 8, ry, wds[i], 6, 3, fg);
-		}
-		break;
-	case G_DISK:
-		for (int i = 0; i < 3; i++) {
-			int ry = cy - 19 + i * 13;
-			fill_round_rect(cx - 19, ry, 38, 12, 6, fg);
-			fill_circle(cx + 12, ry + 6, 2, hole);
-		}
-		break;
-	case G_CHIP:
-		/* a RAM stick, not a gear -- keeps it distinct from SYSTEM */
-		fill_round_rect(cx - 22, cy - 13, 44, 25, 3, fg);
-		for (int i = 0; i < 3; i++)  /* the chips on the module */
-			fill_rect(cx - 17 + i * 12, cy - 7, 9, 12, hole);
-		fill_rect(cx - 3, cy + 8, 6, 4, hole);      /* keying notch */
-		for (int i = 0; i < 8; i++)                 /* contact pins */
-			fill_rect(cx - 21 + i * 6, cy + 12, 3, 6, fg);
-		break;
-	case G_DOC:
-		fill_round_rect(cx - 15, cy - 20, 30, 40, 3, fg);
-		fill_triangle(cx + 11, cy - 16, 6, 3, hole); /* folded corner */
-		fill_rect(cx - 9, cy - 11, 18, 3, hole);
-		fill_rect(cx - 9, cy - 4,  18, 3, hole);
-		fill_rect(cx - 9, cy + 3,  12, 3, hole);
-		fill_rect(cx - 9, cy + 10, 15, 3, hole);
+	case G_GAUGE:
+		/* a bar chart -- reads as "activity / task manager" */
+		fill_round_rect(cx - 20, cy - 18, 40, 36, 4, fg);
+		fill_round_rect(cx - 14, cy + 4,  6, 9,  1, hole);
+		fill_round_rect(cx - 5,  cy - 4,  6, 17, 1, hole);
+		fill_round_rect(cx + 4,  cy - 12, 6, 25, 1, hole);
 		break;
 	case G_FOLDER:
 		fill_round_rect(cx - 19, cy - 17, 17, 9, 3, fg);
@@ -469,6 +443,8 @@ static int icon_at(int px, int py)
 static void update_grid_dims(struct window *w)
 {
 	int content_h = w->h - TITLE_H;
+	if (w->type == WIN_TASKMGR)
+		content_h -= TM_TABH;
 	int newcols = (w->w - 8) / font_w;
 	int newrows = content_h / font_h;
 	if (newcols > GRID_MAXCOLS) newcols = GRID_MAXCOLS;
@@ -811,6 +787,39 @@ static int spawn_terminal(void)
 	return slot;
 }
 
+/* Run a command and paint its stdout into the grid (one-shot). */
+static void fill_grid_from_cmd(struct window *w, const char *cmd)
+{
+	for (int r = 0; r < w->rows; r++)
+		clear_row_range(w, r, 0, w->cols - 1);
+	w->cur_row = 0;
+	w->cur_col = 0;
+	FILE *p = popen(cmd, "r");
+	if (p) {
+		int ch;
+		while ((ch = fgetc(p)) != EOF) {
+			unsigned char c = (unsigned char)ch;
+			if (c == '\r') continue;
+			if (c == '\n') {
+				w->cur_row++;
+				w->cur_col = 0;
+				if (w->cur_row >= w->rows) { scroll_up(w); w->cur_row = w->rows - 1; }
+				continue;
+			}
+			if (c == '\t') {
+				w->cur_col = (w->cur_col / 8 + 1) * 8;
+				if (w->cur_col >= w->cols) w->cur_col = w->cols - 1;
+				continue;
+			}
+			if (c >= 0x20 && c < 0x7f)
+				putch_grid(w, c);
+		}
+		pclose(p);
+	}
+	w->cur_row = 0;
+	w->cur_col = 0;
+}
+
 static int spawn_output_window(const char *title, const char *cmd)
 {
 	int slot = alloc_window_slot();
@@ -828,31 +837,65 @@ static int spawn_output_window(const char *title, const char *cmd)
 	wins[slot].attr_bg = COL_BG_DEFAULT;
 	snprintf(wins[slot].title, sizeof(wins[slot].title), "%s", title);
 	update_grid_dims(&wins[slot]);
-	struct window *w = &wins[slot];
-	for (int r = 0; r < w->rows; r++)
-		clear_row_range(w, r, 0, w->cols - 1);
-
-	FILE *p = popen(cmd, "r");
-	if (p) {
-		int ch;
-		while ((ch = fgetc(p)) != EOF) {
-			unsigned char c = (unsigned char)ch;
-			if (c == '\r') continue;
-			if (c == '\n') {
-				w->cur_row++;
-				w->cur_col = 0;
-				if (w->cur_row >= w->rows) { scroll_up(w); w->cur_row = w->rows - 1; }
-				continue;
-			}
-			putch_grid(w, c);
-		}
-		pclose(p);
-	}
-	w->cur_row = 0;
-	w->cur_col = 0;
+	fill_grid_from_cmd(&wins[slot], cmd);
 	zorder[zcount++] = slot;
 	focused = slot;
 	return slot;
+}
+
+/* ---- task manager: one window, tabs, auto-refresh ---- */
+
+static void taskmgr_refresh(struct window *w)
+{
+	if (w->tab < 0 || w->tab >= TM_NTABS)
+		w->tab = 0;
+	fill_grid_from_cmd(w, tm_tabs[w->tab].cmd);
+	snprintf(w->title, sizeof(w->title), "Task Manager  -  %s", tm_tabs[w->tab].label);
+}
+
+static int spawn_taskmgr(void)
+{
+	/* single-instance: focus the existing one instead of opening a second */
+	for (int i = 0; i < MAX_WIN; i++) {
+		if (wins[i].used && wins[i].type == WIN_TASKMGR) {
+			wins[i].minimized = 0;
+			raise_window(i);
+			focused = i;
+			return i;
+		}
+	}
+	int slot = alloc_window_slot();
+	if (slot < 0)
+		return -1;
+	memset(&wins[slot], 0, sizeof(wins[slot]));
+	wins[slot].used = 1;
+	wins[slot].type = WIN_TASKMGR;
+	wins[slot].pty_fd = -1;
+	wins[slot].x = 180;
+	wins[slot].y = 90;
+	wins[slot].w = 700;
+	wins[slot].h = 460;
+	wins[slot].attr_fg = COL_FG_DEFAULT;
+	wins[slot].attr_bg = COL_BG_DEFAULT;
+	wins[slot].tab = 0;
+	update_grid_dims(&wins[slot]);
+	taskmgr_refresh(&wins[slot]);
+	zorder[zcount++] = slot;
+	focused = slot;
+	return slot;
+}
+
+/* Tab strip hit-test: returns clicked tab index or -1. */
+static int taskmgr_tab_at(struct window *w, int px, int py)
+{
+	int ty = w->y + TITLE_H;
+	if (py < ty || py >= ty + TM_TABH)
+		return -1;
+	int tw = w->w / TM_NTABS;
+	int idx = (px - w->x) / tw;
+	if (idx < 0 || idx >= TM_NTABS)
+		return -1;
+	return idx;
 }
 
 /* ---- file manager ---- */
@@ -1089,6 +1132,28 @@ static void draw_window(struct window *w)
 	int content_y = w->y + TITLE_H, content_h = w->h - TITLE_H;
 	if (content_h < 0)
 		content_h = 0;
+
+	/* task-manager tab strip sits between titlebar and content */
+	if (w->type == WIN_TASKMGR) {
+		int tw = w->w / TM_NTABS;
+		fill_rect(w->x, content_y, w->w, TM_TABH, 0x181826);
+		for (int t = 0; t < TM_NTABS; t++) {
+			int tx = w->x + t * tw;
+			int on = (t == w->tab);
+			fill_rect(tx, content_y, tw - 1, TM_TABH,
+				  on ? COL_BG_DEFAULT : 0x232338);
+			if (on)
+				fill_rect(tx, content_y, tw - 1, 2, win_accent(w));
+			int lw = (int)strlen(tm_tabs[t].label) * font_w;
+			draw_text_clip(tx + (tw - lw) / 2,
+				       content_y + (TM_TABH - font_h) / 2,
+				       tm_tabs[t].label,
+				       on ? 0xffffff : 0x9399b2, tw - 6);
+		}
+		content_y += TM_TABH;
+		content_h -= TM_TABH;
+	}
+
 	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
 
 	for (int r = 0; r < w->rows; r++) {
@@ -1265,8 +1330,15 @@ static void do_hit_test(int x, int y)
 			} else {
 				raise_window(i);
 				focused = i;
-				if (w->type == WIN_FILES)
+				if (w->type == WIN_FILES) {
 					fm_click(w, y);
+				} else if (w->type == WIN_TASKMGR) {
+					int t = taskmgr_tab_at(w, x, y);
+					if (t >= 0 && t != w->tab) {
+						w->tab = t;
+						taskmgr_refresh(w);
+					}
+				}
 				return;
 			}
 		}
@@ -1298,8 +1370,8 @@ static void launch_icon(int idx)
 		spawn_terminal();
 	} else if (ic->action == 4) {
 		spawn_file_window();
-	} else {
-		spawn_output_window(ic->label, ic->cmd);
+	} else if (ic->action == 5) {
+		spawn_taskmgr();
 	}
 }
 
@@ -1598,7 +1670,16 @@ int main(void)
 			}
 		}
 
-		int pr = poll(fds, n, -1);
+		/* Wake at least once a second so the taskbar clock ticks and any
+		 * open Task Manager tab refreshes without needing input. */
+		int pr = poll(fds, n, 1000);
+		if (pr == 0) {
+			for (int i = 0; i < MAX_WIN; i++)
+				if (wins[i].used && wins[i].type == WIN_TASKMGR && !wins[i].minimized)
+					taskmgr_refresh(&wins[i]);
+			redraw_all();
+			continue;
+		}
 		if (pr < 0) {
 			if (errno == EINTR)
 				continue;
