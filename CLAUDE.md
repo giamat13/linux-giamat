@@ -24,6 +24,8 @@ The ISO is meant to boot on a real, separate PC — QEMU is only a fast smoke te
 
 Builds run on Linux (WSL), not Windows. The scripts assume the tree is checked out at `~/build/linux-giamat` and write artifacts into `~/build/`:
 
+Before running `qemu-system-x86_64`, make sure it can't crash or destabilize the real (host) machine it runs on — check available RAM/CPU headroom before picking `-m`/`-smp`, and don't enable device/passthrough options that touch host hardware directly.
+
 ```sh
 make -j$(nproc) bzImage          # -> arch/x86/boot/bzImage
 cc -O2 -o ~/build/fbdesktop fbdesktop.c
@@ -43,6 +45,10 @@ Single file, no X11, no toolkit. It draws pixels straight into a mmap'd `/dev/fb
 The model is a small window manager: icons open windows, windows are draggable/resizable, and there's a taskbar. Two window kinds — a pty-backed VT100-ish terminal rendered onto a character grid, and a one-shot command-output view. State lives in fixed-size arrays (`MAX_WIN`, `GRID_MAXCOLS/ROWS`); there is no allocation-heavy scene graph. Changing layout constants at the top of the file is usually the right knob rather than adding structure.
 
 Because it owns the framebuffer and the tty directly, a crash leaves the console in raw mode — boot the ISO in QEMU to test rather than running it on a host tty.
+
+## Workflow
+
+Always maintain a TODO list (via the TodoWrite tool) for any non-trivial task in this repo, and keep it updated as work progresses.
 
 ## Kernel work
 
