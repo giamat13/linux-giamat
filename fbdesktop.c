@@ -1367,6 +1367,29 @@ static int fm_btn_at(struct window *w, int px, int py)
 }
 
 /* Delete the selected entry. Files are unlinked, directories must be empty. */
+/* Copy/Cut the selected entry to the clipboard -- shared by the Ctrl+C/
+ * Ctrl+X keyboard shortcuts and the right-click menu's Copy/Cut items. */
+static void fm_copy_selected(struct window *w, int cut)
+{
+	struct fmstate *fm = w->fm;
+	if (fm->sel < 0 || fm->sel >= fm->count) {
+		snprintf(fm->status, sizeof(fm->status), "select something first");
+		return;
+	}
+	struct fent *e = &fm->ents[fm->sel];
+	if (!strcmp(e->name, "..")) {
+		snprintf(fm->status, sizeof(fm->status), "cannot %s ..", cut ? "cut" : "copy");
+		return;
+	}
+	if (!cut && !e->isreg) {
+		snprintf(fm->status, sizeof(fm->status), "select a file to copy");
+		return;
+	}
+	fm_path(fm, e->name, clip_path, sizeof(clip_path));
+	clip_mode = cut ? 2 : 1;
+	snprintf(fm->status, sizeof(fm->status), "%s %s", cut ? "cut" : "copied", e->name);
+}
+
 static void fm_delete(struct window *w)
 {
 	struct fmstate *fm = w->fm;
@@ -1471,6 +1494,14 @@ static void fm_paste(struct window *w)
 	char dest[FM_FULLLEN];
 	fm_path(fm, base, dest, sizeof(dest));
 
+	/* Copying onto its own path would truncate the source while reading
+	 * it (open dest "wb" == open src "wb"). Cut is harmless here (rename
+	 * to the same path is a no-op) but there's nothing useful to do either. */
+	if (!strcmp(dest, clip_path)) {
+		snprintf(fm->status, sizeof(fm->status), "already here");
+		return;
+	}
+
 	if (clip_mode == 2) {
 		if (rename(clip_path, dest) == 0) {
 			snprintf(fm->status, sizeof(fm->status), "moved %s", base);
@@ -1505,6 +1536,9 @@ static void desk_paste(void)
 	base = base ? base + 1 : clip_path;
 	char dest[FM_FULLLEN];
 	snprintf(dest, sizeof(dest), "%s/%s", DESKTOP_DIR, base);
+
+	if (!strcmp(dest, clip_path)) /* see fm_paste: copying onto itself corrupts it */
+		return;
 
 	if (clip_mode == 2) {
 		if (rename(clip_path, dest) == 0)
@@ -1606,19 +1640,17 @@ static int ctxmenu_click(int x, int y)
 
 		switch (idx) {
 		case 0: /* Copy */
-			if (has_target && e->isreg) {
-				fm_path(fm, e->name, clip_path, sizeof(clip_path));
-				clip_mode = 1;
-				snprintf(fm->status, sizeof(fm->status), "copied %s", e->name);
+			if (has_target) {
+				fm->sel = ctxmenu_entidx;
+				fm_copy_selected(w, 0);
 			} else {
 				snprintf(fm->status, sizeof(fm->status), "select a file to copy");
 			}
 			break;
 		case 1: /* Cut */
 			if (has_target) {
-				fm_path(fm, e->name, clip_path, sizeof(clip_path));
-				clip_mode = 2;
-				snprintf(fm->status, sizeof(fm->status), "cut %s", e->name);
+				fm->sel = ctxmenu_entidx;
+				fm_copy_selected(w, 1);
 			} else {
 				snprintf(fm->status, sizeof(fm->status), "select something to cut");
 			}
@@ -1943,30 +1975,66 @@ static int fm_keys(struct window *w, const char *buf, int n)
 	}
 
 	for (int i = 0; i < n; i++) {
-		if (buf[i] == 0x06) { /* Ctrl+F */
+		unsigned char c = (unsigned char)buf[i];
+
+		if (c == 0x1b && i + 1 < n && buf[i + 1] == '[') {
+			if (i + 3 < n && buf[i + 2] == '3' && buf[i + 3] == '~') {
+				/* Delete key: ESC [ 3 ~ -- same two-press confirm as
+				 * the toolbar's Delete button. */
+				fm->status[0] = 0;
+				if (!fm->confirm_del) {
+					fm->confirm_del = 1;
+					snprintf(fm->status, sizeof(fm->status), "press Delete again to confirm");
+				} else {
+					fm->confirm_del = 0;
+					fm_delete(w);
+				}
+				fm_render(w);
+				changed = 1;
+				i += 3;
+				continue;
+			}
+			if (i + 2 < n) {
+				int delta = 0;
+				switch (buf[i + 2]) {
+				case 'A': delta = -1; break;
+				case 'B': delta = 1; break;
+				case '5': delta = -(w->rows - 1); break;
+				case '6': delta = w->rows - 1; break;
+				default: break;
+				}
+				fm->confirm_del = 0;
+				if (delta) {
+					fm->scroll += delta;
+					fm_render(w); /* clamps scroll */
+					changed = 1;
+				}
+				i += 2;
+				continue;
+			}
+		}
+
+		if (c == 0x06) { /* Ctrl+F */
+			fm->confirm_del = 0;
 			fm->searching = 1;
 			fm_render(w);
 			return 1;
 		}
-	}
-
-	for (int i = 0; i + 2 < n; i++) {
-		if (buf[i] != 0x1b || buf[i + 1] != '[')
-			continue;
-		int delta = 0;
-		switch (buf[i + 2]) {
-		case 'A': delta = -1; break;
-		case 'B': delta = 1; break;
-		case '5': delta = -(w->rows - 1); break;
-		case '6': delta = w->rows - 1; break;
-		default: break;
-		}
-		if (delta) {
-			fm->scroll += delta;
-			fm_render(w); /* clamps scroll */
+		if (c == 0x03) { /* Ctrl+C */
+			fm->confirm_del = 0;
+			fm_copy_selected(w, 0);
+			fm_render(w);
+			changed = 1;
+		} else if (c == 0x18) { /* Ctrl+X */
+			fm->confirm_del = 0;
+			fm_copy_selected(w, 1);
+			fm_render(w);
+			changed = 1;
+		} else if (c == 0x16) { /* Ctrl+V */
+			fm->confirm_del = 0;
+			fm_paste(w);
 			changed = 1;
 		}
-		i += 2;
 	}
 	return changed;
 }
