@@ -5,6 +5,7 @@
  * Font is pulled live from the kernel's own VT console font (KDFONTOP). */
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -76,9 +77,13 @@ static const struct theme themes[] = {
 	{"Midnight", 0x232338, 0x14141f, 0x3b82f6},
 	{"Forest",   0x1e2f24, 0x0d1712, 0x22c55e},
 	{"Ember",    0x2f2420, 0x1a1210, 0xf97316},
+	{"Solarized",0x002b36, 0x073642, 0xb58900},
+	{"Dracula",  0x282a36, 0x21222c, 0xff79c6},
 };
 #define NUM_THEMES (int)(sizeof(themes)/sizeof(themes[0]))
 static int theme_idx;
+static int show_hidden;         /* show .* files in file manager */
+static int dblclick_delay = 200; /* ms: threshold before drag icon/row becomes selection */
 
 /* One-second samples of CPU / memory use, oldest first. */
 #define HIST 60
@@ -113,6 +118,23 @@ static int icon_grab_dx, icon_grab_dy;
 /* cwd + '/' + name + NUL: any child path is guaranteed to fit */
 #define FM_FULLLEN (FM_PATHLEN + FM_NAMELEN + 2)
 
+/* Right-click context menu: single global instance, owned by one FILES
+ * window at a time. ctxmenu_entidx indexes into that window's fm->ents.
+ * Declared here (not lower, by fm_puts) because close_window() needs it. */
+static int ctxmenu_win = -1;
+static int ctxmenu_entidx = -1;
+static int ctxmenu_x, ctxmenu_y;
+#define CTX_W 130
+#define CTX_ITEMH 24
+#define CTX_NITEMS 5
+static const char *ctx_items[CTX_NITEMS] = { "Copy", "Cut", "Paste", "Rename", "Delete" };
+
+/* Clipboard: one path at a time. mode: 0 none, 1 copy, 2 cut.
+ * ponytail: files only (fopen/fread copy); directories support Cut (rename)
+ * but not Copy -- a recursive copy is a bigger feature than this needs yet. */
+static char clip_path[FM_FULLLEN];
+static int clip_mode;
+
 struct fent {
 	char name[FM_NAMELEN];
 	int isdir;
@@ -125,11 +147,16 @@ struct fmstate {
 	struct fent ents[FM_MAXENT];
 	int count;
 	int scroll;
-	int sel;          /* selected row, -1 = none */
-	int prompt;       /* 0 none, 1 new file, 2 new folder */
+	int sel;          /* selected row (index into ents), -1 = none */
+	int prompt;       /* 0 none, 1 new file, 2 new folder, 3 rename */
 	char pbuf[FM_NAMELEN];
 	int confirm_del;  /* Delete was armed: the next click actually deletes */
 	char status[64];
+
+	char search[FM_NAMELEN];
+	int searching;    /* Ctrl+F is capturing keys into search[] */
+	int view[FM_MAXENT]; /* indices into ents[] that pass the search filter */
+	int vcount;
 };
 
 /* File-manager toolbar, drawn between titlebar and listing. */
@@ -196,11 +223,11 @@ static int xres, yres, bpp, line_length;
 static unsigned char font[512 * 32 * 4];
 static int have_font;
 static int font_w = 8, font_h = 16, font_bpr = 1;
-static int mx, my, prev_left;
+static int mx, my, prev_left, prev_right;
 /* absolute pointer (evdev tablet) + evdev keyboard for Alt+Tab */
 static int absptr_fd = -1, kbd_evdev_fd = -1;
 static int abs_minx, abs_maxx, abs_miny, abs_maxy;
-static int abs_curx, abs_cury, abs_btn;
+static int abs_curx, abs_cury, abs_btn, abs_rbtn;
 static FILE *dbg;
 static struct termios orig_termios;
 static int have_orig_termios;
@@ -770,6 +797,8 @@ static void close_window(int i)
 		drag_win = -1;
 		drag_mode = 0;
 	}
+	if (ctxmenu_win == i)
+		ctxmenu_win = -1;
 }
 
 static void toggle_maximize(int i)
@@ -961,10 +990,38 @@ static void fm_puts(struct window *w, int row, int col, const char *s, uint32_t 
 	}
 }
 
+/* Case-insensitive substring test. */
+static int fm_match(const char *name, const char *needle)
+{
+	if (!needle[0])
+		return 1;
+	size_t nlen = strlen(needle);
+	for (const char *p = name; *p; p++) {
+		size_t i = 0;
+		while (i < nlen && p[i] &&
+		       tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+			i++;
+		if (i == nlen)
+			return 1;
+	}
+	return 0;
+}
+
+/* Rebuild fm->view[] from fm->ents[] against the current search filter.
+ * ".." always stays visible so search never traps you in a directory. */
+static void fm_apply_filter(struct fmstate *fm)
+{
+	fm->vcount = 0;
+	for (int i = 0; i < fm->count; i++) {
+		if (!strcmp(fm->ents[i].name, "..") || fm_match(fm->ents[i].name, fm->search))
+			fm->view[fm->vcount++] = i;
+	}
+}
+
 static void fm_render(struct window *w)
 {
 	struct fmstate *fm = w->fm;
-	int maxscroll = fm->count - w->rows;
+	int maxscroll = fm->vcount - w->rows;
 	if (maxscroll < 0) maxscroll = 0;
 	if (fm->scroll > maxscroll) fm->scroll = maxscroll;
 	if (fm->scroll < 0) fm->scroll = 0;
@@ -973,13 +1030,23 @@ static void fm_render(struct window *w)
 		clear_row_range(w, r, 0, w->cols - 1);
 
 	for (int r = 0; r < w->rows; r++) {
-		int i = fm->scroll + r;
-		if (i >= fm->count)
+		int vi = fm->scroll + r;
+		if (vi >= fm->vcount)
 			break;
+		int i = fm->view[vi];
 		struct fent *e = &fm->ents[i];
 		char line[FM_NAMELEN + 16];
 		snprintf(line, sizeof(line), "%s %s", e->isdir ? "[DIR]" : "     ", e->name);
-		fm_puts(w, r, 0, line, e->isdir ? 0x89b4fa : COL_FG_DEFAULT);
+		/* Hidden files appear dimmed (starts with .) */
+		int is_hidden = (e->name[0] == '.');
+		uint32_t color;
+		if (is_hidden)
+			color = 0x6c7086;  /* dimmed gray */
+		else if (e->isdir)
+			color = 0x89b4fa;  /* blue */
+		else
+			color = COL_FG_DEFAULT;
+		fm_puts(w, r, 0, line, color);
 		if (e->isreg) {
 			char sz[24];
 			snprintf(sz, sizeof(sz), "%ld", e->size);
@@ -1031,6 +1098,9 @@ static void fm_load(struct window *w)
 			if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
 				continue;
 			struct fent *e = &fm->ents[fm->count];
+			/* Skip hidden files unless show_hidden is on. */
+			if (!show_hidden && de->d_name[0] == '.')
+				continue;
 			/* A name too long to store is a name we could never open again. */
 			if (strlen(de->d_name) >= FM_NAMELEN)
 				continue;
@@ -1052,6 +1122,7 @@ static void fm_load(struct window *w)
 		/* sort everything after the ".." entry, which must stay first */
 		qsort(fm->ents + start, fm->count - start, sizeof(struct fent), fent_cmp);
 	}
+	fm_apply_filter(fm);
 	snprintf(w->title, sizeof(w->title), "%s", fm->cwd);
 	fm_render(w);
 }
@@ -1120,6 +1191,173 @@ static void fm_create(struct window *w)
 	fm_load(w);
 }
 
+/* Rename fm->sel to fm->pbuf, both within the current directory. */
+static void fm_rename(struct window *w)
+{
+	struct fmstate *fm = w->fm;
+	if (!fm->pbuf[0] || strchr(fm->pbuf, '/')) {
+		snprintf(fm->status, sizeof(fm->status), "bad name");
+		fm->prompt = 0;
+		return;
+	}
+	if (fm->sel < 0 || fm->sel >= fm->count) {
+		fm->prompt = 0;
+		return;
+	}
+	struct fent *e = &fm->ents[fm->sel];
+	char oldpath[FM_FULLLEN], newpath[FM_FULLLEN];
+	fm_path(fm, e->name, oldpath, sizeof(oldpath));
+	fm_path(fm, fm->pbuf, newpath, sizeof(newpath));
+	if (rename(oldpath, newpath) != 0)
+		snprintf(fm->status, sizeof(fm->status), "rename failed: %s", strerror(errno));
+	else
+		snprintf(fm->status, sizeof(fm->status), "renamed to %s", fm->pbuf);
+	fm->prompt = 0;
+	fm->pbuf[0] = 0;
+	fm_load(w);
+}
+
+/* Paste the clipboard into the current directory. Cut = rename (same fs
+ * only); Copy = plain byte-for-byte file copy, no directories. */
+static void fm_paste(struct window *w)
+{
+	struct fmstate *fm = w->fm;
+	if (!clip_mode) {
+		snprintf(fm->status, sizeof(fm->status), "clipboard is empty");
+		return;
+	}
+	const char *base = strrchr(clip_path, '/');
+	base = base ? base + 1 : clip_path;
+	char dest[FM_FULLLEN];
+	fm_path(fm, base, dest, sizeof(dest));
+
+	if (clip_mode == 2) {
+		if (rename(clip_path, dest) == 0) {
+			snprintf(fm->status, sizeof(fm->status), "moved %s", base);
+			clip_mode = 0;
+		} else {
+			snprintf(fm->status, sizeof(fm->status), "move failed: %s", strerror(errno));
+		}
+	} else {
+		FILE *in = fopen(clip_path, "rb");
+		FILE *out = in ? fopen(dest, "wb") : NULL;
+		if (!in || !out) {
+			snprintf(fm->status, sizeof(fm->status), "copy failed: %s", strerror(errno));
+		} else {
+			char buf[4096];
+			size_t n;
+			while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+				fwrite(buf, 1, n, out);
+			snprintf(fm->status, sizeof(fm->status), "pasted %s", base);
+		}
+		if (in) fclose(in);
+		if (out) fclose(out);
+	}
+	fm_load(w);
+}
+
+/* Right-click: open the context menu over whichever FILES window (and row,
+ * if any) is under the cursor. Closes any menu already open elsewhere. */
+static void ctxmenu_open(int x, int y)
+{
+	ctxmenu_win = -1;
+	for (int zi = zcount - 1; zi >= 0; zi--) {
+		int i = zorder[zi];
+		if (!wins[i].used || wins[i].minimized || wins[i].type != WIN_FILES)
+			continue;
+		struct window *w = &wins[i];
+		if (x < w->x || x >= w->x + w->w || y < w->y || y >= w->y + w->h)
+			continue;
+		raise_window(i);
+		focused = i;
+
+		struct fmstate *fm = w->fm;
+		int content_top = w->y + TITLE_H + FM_TOOLH;
+		int row = (y - content_top) / font_h;
+		int entidx = -1;
+		if (row >= 0 && row < w->rows) {
+			int vi = fm->scroll + row;
+			if (vi >= 0 && vi < fm->vcount)
+				entidx = fm->view[vi];
+		}
+		if (entidx >= 0)
+			fm->sel = entidx;
+		ctxmenu_entidx = entidx;
+		ctxmenu_win = i;
+		ctxmenu_x = x;
+		ctxmenu_y = y;
+		int h = CTX_NITEMS * CTX_ITEMH;
+		if (ctxmenu_x + CTX_W > xres) ctxmenu_x = xres - CTX_W;
+		if (ctxmenu_y + h > yres - TASK_H) ctxmenu_y = yres - TASK_H - h;
+		fm_render(w);
+		return;
+	}
+}
+
+/* Returns 1 if the click landed on the open menu (whether or not it hit an
+ * item), 0 if the caller should still run the normal hit-test. Either way
+ * the menu is closed by the caller right after. */
+static int ctxmenu_click(int x, int y)
+{
+	if (ctxmenu_win < 0 || !wins[ctxmenu_win].used)
+		return 0;
+	int h = CTX_NITEMS * CTX_ITEMH;
+	if (x < ctxmenu_x || x >= ctxmenu_x + CTX_W || y < ctxmenu_y || y >= ctxmenu_y + h)
+		return 0;
+
+	int idx = (y - ctxmenu_y) / CTX_ITEMH;
+	struct window *w = &wins[ctxmenu_win];
+	struct fmstate *fm = w->fm;
+	struct fent *e = NULL;
+	if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
+		e = &fm->ents[ctxmenu_entidx];
+	int has_target = e && strcmp(e->name, "..");
+	fm->status[0] = 0;
+
+	switch (idx) {
+	case 0: /* Copy */
+		if (has_target && e->isreg) {
+			fm_path(fm, e->name, clip_path, sizeof(clip_path));
+			clip_mode = 1;
+			snprintf(fm->status, sizeof(fm->status), "copied %s", e->name);
+		} else {
+			snprintf(fm->status, sizeof(fm->status), "select a file to copy");
+		}
+		break;
+	case 1: /* Cut */
+		if (has_target) {
+			fm_path(fm, e->name, clip_path, sizeof(clip_path));
+			clip_mode = 2;
+			snprintf(fm->status, sizeof(fm->status), "cut %s", e->name);
+		} else {
+			snprintf(fm->status, sizeof(fm->status), "select something to cut");
+		}
+		break;
+	case 2: /* Paste */
+		fm_paste(w);
+		break;
+	case 3: /* Rename */
+		if (has_target) {
+			fm->sel = ctxmenu_entidx;
+			fm->prompt = 3;
+			snprintf(fm->pbuf, sizeof(fm->pbuf), "%s", e->name);
+		} else {
+			snprintf(fm->status, sizeof(fm->status), "select something to rename");
+		}
+		break;
+	case 4: /* Delete */
+		if (has_target) {
+			fm->sel = ctxmenu_entidx;
+			fm_delete(w);
+		} else {
+			snprintf(fm->status, sizeof(fm->status), "select something to delete");
+		}
+		break;
+	}
+	fm_render(w);
+	return 1;
+}
+
 static void fm_toolbar(struct window *w, int btn)
 {
 	struct fmstate *fm = w->fm;
@@ -1163,9 +1401,10 @@ static void fm_click(struct window *w, int x, int y)
 	int row = (y - (w->y + TITLE_H + FM_TOOLH)) / font_h;
 	if (row < 0 || row >= w->rows)
 		return;
-	int i = fm->scroll + row;
-	if (i < 0 || i >= fm->count)
+	int vi = fm->scroll + row;
+	if (vi < 0 || vi >= fm->vcount)
 		return;
+	int i = fm->view[vi];
 	/* First click selects (so Delete has a target), a second one opens it. */
 	if (fm->sel != i) {
 		fm->sel = i;
@@ -1180,6 +1419,7 @@ static void fm_click(struct window *w, int x, int y)
 			*slash = 0;
 		else
 			strcpy(fm->cwd, "/");
+		fm->search[0] = 0;
 		fm_load(w);
 		return;
 	}
@@ -1192,6 +1432,7 @@ static void fm_click(struct window *w, int x, int y)
 		if (strlen(path) >= sizeof(fm->cwd))
 			return;
 		memcpy(fm->cwd, path, strlen(path) + 1);
+		fm->search[0] = 0;
 		fm_load(w);
 	} else if (e->isreg) {
 		/* Regular files only: opening a fifo or char device would block forever. */
@@ -1199,8 +1440,9 @@ static void fm_click(struct window *w, int x, int y)
 	}
 }
 
-/* While a New File / New Dir prompt is open, keys go into the name field.
- * Otherwise arrows / PageUp / PageDown scroll the listing. */
+/* While a New File / New Dir / Rename prompt is open, keys go into the name
+ * field. While searching, keys go into the search filter. Otherwise arrows /
+ * PageUp / PageDown scroll the listing and Ctrl+F starts a search. */
 static int fm_keys(struct window *w, const char *buf, int n)
 {
 	struct fmstate *fm = w->fm;
@@ -1211,7 +1453,10 @@ static int fm_keys(struct window *w, const char *buf, int n)
 			unsigned char c = (unsigned char)buf[i];
 			int len = (int)strlen(fm->pbuf);
 			if (c == '\r' || c == '\n') {
-				fm_create(w);
+				if (fm->prompt == 3)
+					fm_rename(w);
+				else
+					fm_create(w);
 			} else if (c == 0x1b) {
 				fm->prompt = 0;
 				fm->pbuf[0] = 0;
@@ -1227,6 +1472,41 @@ static int fm_keys(struct window *w, const char *buf, int n)
 		}
 		fm_render(w);
 		return changed;
+	}
+
+	if (fm->searching) {
+		for (int i = 0; i < n; i++) {
+			unsigned char c = (unsigned char)buf[i];
+			int len = (int)strlen(fm->search);
+			if (c == '\r' || c == '\n') {
+				fm->searching = 0;
+			} else if (c == 0x1b) {
+				fm->searching = 0;
+				fm->search[0] = 0;
+				fm->sel = -1;
+			} else if ((c == 0x7f || c == '\b') && len > 0) {
+				fm->search[len - 1] = 0;
+			} else if (c >= 0x20 && c < 0x7f && len < FM_NAMELEN - 1) {
+				fm->search[len] = (char)c;
+				fm->search[len + 1] = 0;
+			} else {
+				continue;
+			}
+			fm_apply_filter(fm);
+			changed = 1;
+			if (!fm->searching)
+				break; /* Enter/Esc ended input; the rest isn't ours */
+		}
+		fm_render(w);
+		return changed;
+	}
+
+	for (int i = 0; i < n; i++) {
+		if (buf[i] == 0x06) { /* Ctrl+F */
+			fm->searching = 1;
+			fm_render(w);
+			return 1;
+		}
 	}
 
 	for (int i = 0; i + 2 < n; i++) {
@@ -1514,8 +1794,10 @@ static void draw_settings(struct window *w, int content_y)
 {
 	draw_text(w->x + 16, content_y + 14, "Theme", 0xffffff);
 	for (int t = 0; t < NUM_THEMES; t++) {
-		int bx = w->x + 16 + t * (SET_BTNW + 10);
-		int by = content_y + 38;
+		int row = t / 3;
+		int col = t % 3;
+		int bx = w->x + 16 + col * (SET_BTNW + 10);
+		int by = content_y + 38 + row * (SET_BTNH + 8);
 		int on = (t == theme_idx);
 		fill_round_rect_grad(bx, by, SET_BTNW, SET_BTNH, 6,
 				     mix(themes[t].dtop, 0xffffff, on ? 40 : 0),
@@ -1527,25 +1809,39 @@ static void draw_settings(struct window *w, int content_y)
 			       on ? 0xffffff : 0xa6adc8, SET_BTNW - 32);
 	}
 
+	/* Show hidden files toggle */
+	draw_text(w->x + 16, content_y + 130, "Show hidden files", 0xffffff);
+	int cx = w->x + 16 + 170, cy = content_y + 130;
+	fill_round_rect(cx, cy, 32, 16, 8,
+		        show_hidden ? 0x22c55e : 0x6c7086);
+	fill_circle(cx + (show_hidden ? 24 : 8), cy + 8, 6, 0xffffff);
+
+	/* Display info */
 	char info[256];
 	snprintf(info, sizeof(info),
-		 "Display\n  %dx%d  %d bpp\n  font %dx%d (kernel VT)\n"
+		 "\nDisplay\n  %dx%d  %d bpp\n  font %dx%d (kernel VT)\n"
 		 "\nMode is fixed by GRUB gfxpayload at boot.",
 		 xres, yres, bpp, font_w, font_h);
-	draw_text(w->x + 16, content_y + 90, info, 0x9399b2);
+	draw_text(w->x + 16, content_y + 160, info, 0x9399b2);
 }
 
-/* Theme button hit-test; returns the clicked theme or -1. */
+/* Settings hit-test: theme buttons (arranged 3+2), or hidden-files toggle.
+ * Returns: 0-NUM_THEMES for themes, NUM_THEMES for toggle, -1 for none. */
 static int settings_click(struct window *w, int px, int py)
 {
-	int by = w->y + TITLE_H + 38;
-	if (py < by || py >= by + SET_BTNH)
-		return -1;
 	for (int t = 0; t < NUM_THEMES; t++) {
-		int bx = w->x + 16 + t * (SET_BTNW + 10);
-		if (px >= bx && px < bx + SET_BTNW)
+		int row = t / 3;
+		int col = t % 3;
+		int bx = w->x + 16 + col * (SET_BTNW + 10);
+		int by = w->y + TITLE_H + 38 + row * (SET_BTNH + 8);
+		if (px >= bx && px < bx + SET_BTNW && py >= by && py < by + SET_BTNH)
 			return t;
 	}
+	/* Hidden files toggle at offset 130 */
+	int ty = w->y + TITLE_H + 130;
+	int tx = w->x + 16 + 170;
+	if (px >= tx && px < tx + 32 && py >= ty && py < ty + 16)
+		return NUM_THEMES;
 	return -1;
 }
 
@@ -1690,16 +1986,24 @@ static void draw_window(struct window *w)
 				       content_y + (FM_TOOLH - font_h) / 2,
 				       fm_btns[b], 0xdfe4f2, FM_BTNW - 6);
 		}
-		/* name prompt / status share the strip to the right of the buttons */
+		/* name prompt / search / status share the strip right of the buttons */
 		int tx = w->x + 6 + FM_NBTN * (FM_BTNW + 4) + 6;
 		int ty2 = content_y + (FM_TOOLH - font_h) / 2;
 		if (fm->prompt) {
+			static const char *plabel[] = { "", "file", "dir", "rename" };
 			char line[FM_NAMELEN + 16];
-			snprintf(line, sizeof(line), "%s: %s_",
-				 fm->prompt == 2 ? "dir" : "file", fm->pbuf);
+			snprintf(line, sizeof(line), "%s: %s_", plabel[fm->prompt], fm->pbuf);
 			draw_text_clip(tx, ty2, line, 0xf9e2af, w->x + w->w - tx - 6);
+		} else if (fm->searching) {
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "search: %s_", fm->search);
+			draw_text_clip(tx, ty2, line, 0x94e2d5, w->x + w->w - tx - 6);
 		} else if (fm->status[0]) {
 			draw_text_clip(tx, ty2, fm->status, 0x9399b2, w->x + w->w - tx - 6);
+		} else if (fm->search[0]) {
+			char line[FM_NAMELEN + 16];
+			snprintf(line, sizeof(line), "filter: %s", fm->search);
+			draw_text_clip(tx, ty2, line, 0x6c7086, w->x + w->w - tx - 6);
 		}
 		content_y += FM_TOOLH;
 		content_h -= FM_TOOLH;
@@ -1877,6 +2181,31 @@ static void cycle_window_focus(void)
 	}
 }
 
+static void draw_ctxmenu(void)
+{
+	if (ctxmenu_win < 0 || !wins[ctxmenu_win].used) {
+		ctxmenu_win = -1;
+		return;
+	}
+	struct fmstate *fm = wins[ctxmenu_win].fm;
+	struct fent *e = NULL;
+	if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
+		e = &fm->ents[ctxmenu_entidx];
+	int has_target = e && strcmp(e->name, "..");
+	int h = CTX_NITEMS * CTX_ITEMH;
+
+	fill_round_rect(ctxmenu_x + 3, ctxmenu_y + 4, CTX_W, h, 6, 0x0a0a11);
+	fill_round_rect(ctxmenu_x, ctxmenu_y, CTX_W, h, 6, 0x2e2e3c);
+	for (int i = 0; i < CTX_NITEMS; i++) {
+		int iy = ctxmenu_y + i * CTX_ITEMH;
+		int enabled = (i == 2) ? clip_mode
+			     : (i == 0) ? (has_target && e->isreg)
+			     : has_target;
+		draw_text(ctxmenu_x + 10, iy + (CTX_ITEMH - font_h) / 2,
+			  ctx_items[i], enabled ? 0xdfe4f2 : 0x585b70);
+	}
+}
+
 static void redraw_all(void)
 {
 	fill_vgradient(0, 0, xres, yres - TASK_H,
@@ -1888,6 +2217,7 @@ static void redraw_all(void)
 			draw_window(&wins[i]);
 	}
 	draw_taskbar();
+	draw_ctxmenu();
 	draw_cursor(mx, my);
 	if (backbuf)
 		memcpy(fbp, backbuf, (size_t)line_length * yres);
@@ -1967,8 +2297,15 @@ static void do_hit_test(int x, int y)
 					ed_click(w, x, y);
 				} else if (w->type == WIN_SETTINGS) {
 					int t = settings_click(w, x, y);
-					if (t >= 0)
+					if (t >= 0 && t < NUM_THEMES) {
 						theme_idx = t;
+					} else if (t == NUM_THEMES) {
+						show_hidden = !show_hidden;
+						/* Reload all open file windows to show/hide .* files */
+						for (int i = 0; i < MAX_WIN; i++)
+							if (wins[i].used && wins[i].type == WIN_FILES && wins[i].fm)
+								fm_load(&wins[i]);
+					}
 				} else if (w->type == WIN_TASKMGR) {
 					int t = taskmgr_tab_at(w, x, y);
 					if (t >= 0 && t != w->tab) {
@@ -2016,7 +2353,7 @@ static void launch_icon(int idx)
 
 /* Shared pointer handler: nx,ny = new absolute cursor position, left = button.
  * Works for both absolute (evdev tablet) and relative (PS/2 mouse) sources. */
-static int process_pointer(int nx, int ny, int left)
+static int process_pointer(int nx, int ny, int left, int right)
 {
 	if (nx < 0) nx = 0;
 	if (ny < 0) ny = 0;
@@ -2054,7 +2391,16 @@ static int process_pointer(int nx, int ny, int left)
 			changed = 1;
 		}
 	} else if (left && !prev_left) {
-		do_hit_test(mx, my);
+		/* An open context menu eats the next click: on it, run the item;
+		 * off it, dismiss it and let the click through to the desktop. */
+		if (ctxmenu_win >= 0) {
+			int handled = ctxmenu_click(mx, my);
+			ctxmenu_win = -1;
+			if (!handled)
+				do_hit_test(mx, my);
+		} else {
+			do_hit_test(mx, my);
+		}
 		changed = 1;
 	}
 
@@ -2078,6 +2424,13 @@ static int process_pointer(int nx, int ny, int left)
 		drag_win = -1;
 	}
 	prev_left = left;
+
+	if (right && !prev_right) {
+		ctxmenu_open(mx, my);
+		changed = 1;
+	}
+	prev_right = right;
+
 	return changed;
 }
 
@@ -2085,12 +2438,13 @@ static int process_pointer(int nx, int ny, int left)
 static int handle_mouse_packet(unsigned char *pkt)
 {
 	int left = pkt[0] & 0x1;
+	int right = pkt[0] & 0x2;
 	int dx = pkt[1];
 	int dy = pkt[2];
 	if (pkt[0] & 0x10) dx -= 256;
 	if (pkt[0] & 0x20) dy -= 256;
 	dy = -dy;
-	return process_pointer(mx + dx, my + dy, left);
+	return process_pointer(mx + dx, my + dy, left, right);
 }
 
 /* Read all pending events from the absolute pointer; map to screen coords. */
@@ -2105,12 +2459,14 @@ static int read_abs_pointer(void)
 		} else if (ev.type == EV_KEY) {
 			if (ev.code == BTN_LEFT || ev.code == BTN_TOUCH)
 				abs_btn = ev.value ? 1 : 0;
+			else if (ev.code == BTN_RIGHT)
+				abs_rbtn = ev.value ? 1 : 0;
 		} else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
 			int rx = abs_maxx - abs_minx; if (rx <= 0) rx = 1;
 			int ry = abs_maxy - abs_miny; if (ry <= 0) ry = 1;
 			int nx = (int)((long)(abs_curx - abs_minx) * (xres - 1) / rx);
 			int ny = (int)((long)(abs_cury - abs_miny) * (yres - 1) / ry);
-			if (process_pointer(nx, ny, abs_btn))
+			if (process_pointer(nx, ny, abs_btn, abs_rbtn))
 				changed = 1;
 		}
 	}
