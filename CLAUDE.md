@@ -10,6 +10,10 @@ A fork of the Linux kernel (7.2-rc3) plus a small out-of-tree userspace experime
 - `build-initramfs.sh` / `build-iso.sh` — package the kernel + fbdesktop into a bootable ISO.
 - Local netfilter changes (`net/netfilter/xt_{hl,dscp,rateest,tcpmss}.c` and their uapi headers, commit `1db51fc`).
 
+## Hard requirement: must boot on real hardware
+
+The ISO is meant to boot on a real, separate PC — QEMU is only a fast smoke test, never the target. Anything that only works because of the dev host (WSL paths, Windows drives, host binaries/libs, `/mnt/c`, network shares back to the host, QEMU-only devices or virtio drivers, a display mode only QEMU offers) is a bug, not a shortcut. Everything the running system needs must be inside the kernel image or the initramfs, statically resolvable at boot with no host in the picture. Assume real hardware: different GPU/framebuffer resolution, USB keyboard and mouse (not PS/2), real disks, and no serial console. Before calling something done, ask "would this still work if I burned the ISO to a USB stick and booted a machine that has never seen WSL?" — if not, fix it.
+
 ## Build & boot loop
 
 Builds run on Linux (WSL), not Windows. The scripts assume the tree is checked out at `~/build/linux-giamat` and write artifacts into `~/build/`:
