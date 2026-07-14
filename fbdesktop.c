@@ -45,7 +45,7 @@
 enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS };
 
 enum glyph {
-	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR
+	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE
 };
 
 struct icon {
@@ -118,11 +118,15 @@ static int icon_grab_dx, icon_grab_dy;
 /* cwd + '/' + name + NUL: any child path is guaranteed to fit */
 #define FM_FULLLEN (FM_PATHLEN + FM_NAMELEN + 2)
 
-/* Right-click context menu: single global instance, owned by one FILES
- * window at a time. ctxmenu_entidx indexes into that window's fm->ents.
- * Declared here (not lower, by fm_puts) because close_window() needs it. */
-static int ctxmenu_win = -1;
-static int ctxmenu_entidx = -1;
+/* Right-click context menu: single global instance, opened either on a
+ * FILES window's row (CTXMODE_FILEWIN) or on the desktop background
+ * (CTXMODE_DESKTOP). Declared here (not lower, by fm_puts) because
+ * close_window() needs it. */
+enum { CTXMODE_NONE, CTXMODE_FILEWIN, CTXMODE_DESKTOP };
+static int ctxmenu_mode;
+static int ctxmenu_win = -1;    /* FILEWIN: owning window */
+static int ctxmenu_entidx = -1; /* FILEWIN: index into that window's fm->ents */
+static int ctxmenu_deskidx = -1;/* DESKTOP: index into desk_files[], -1 = empty area */
 static int ctxmenu_x, ctxmenu_y;
 #define CTX_W 130
 #define CTX_ITEMH 24
@@ -134,6 +138,28 @@ static const char *ctx_items[CTX_NITEMS] = { "Copy", "Cut", "Paste", "Rename", "
  * but not Copy -- a recursive copy is a bigger feature than this needs yet. */
 static char clip_path[FM_FULLLEN];
 static int clip_mode;
+
+/* The desktop is backed by a real directory, same as Windows: icons/*
+ * files there are drawn as desktop icons after the fixed app icons, and
+ * dropping a file manager row onto the desktop copies it in here. */
+#define DESKTOP_DIR "/root/Desktop"
+#define DESK_MAXFILES 64
+struct deskfile {
+	char name[FM_NAMELEN];
+	int isdir;
+};
+static struct deskfile desk_files[DESK_MAXFILES];
+static int desk_count;
+
+/* File-row drag (file manager listing): press arms a candidate; movement
+ * past a threshold turns it into a drag; release either drops it (moves
+ * into a folder row, copies onto the desktop) or, if it never moved,
+ * behaves like a normal click (select, or open if already selected). */
+static int fmdrag_win = -1;
+static int fmdrag_entidx = -1;
+static int fmdrag_active;
+static int fmdrag_was_preselected;
+static int fmdrag_grab_x, fmdrag_grab_y;
 
 struct fent {
 	char name[FM_NAMELEN];
@@ -466,6 +492,14 @@ static void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_circle(cx, cy, 14, fg);
 		fill_circle(cx, cy, 6, hole);
 		break;
+	case G_FILE:
+		/* a page with a folded corner and a couple of text lines */
+		fill_round_rect(cx - 16, cy - 20, 32, 40, 3, fg);
+		fill_triangle(cx + 16, cy - 20, 9, 1, hole);
+		fill_rect(cx - 9, cy - 4, 18, 3, hole);
+		fill_rect(cx - 9, cy + 4, 18, 3, hole);
+		fill_rect(cx - 9, cy + 12, 12, 3, hole);
+		break;
 	default:
 		break;
 	}
@@ -490,6 +524,19 @@ static void clamp_icon(struct icon *ic)
 	if (ic->y > yres - TASK_H - ICON_H) ic->y = yres - TASK_H - ICON_H;
 }
 
+/* Desktop files sit in the same grid as the fixed app icons, continuing
+ * right after them; unlike app icons their position is always computed
+ * (not draggable-to-reposition), since it comes from a real directory
+ * listing that can change size at any time. */
+static void desk_item_pos(int idx, int *ox, int *oy)
+{
+	int cols = (xres - ICON_GAP) / (ICON_W + ICON_GAP);
+	if (cols < 1)
+		cols = 1;
+	*ox = ICON_GAP + (idx % cols) * (ICON_W + ICON_GAP);
+	*oy = ICON_GAP + (idx / cols) * (ICON_H + ICON_GAP);
+}
+
 static void draw_icons(void)
 {
 	for (int i = 0; i < NUM_ICONS; i++) {
@@ -511,6 +558,24 @@ static void draw_icons(void)
 		int lx = ic->x + (ICON_W - len * font_w) / 2;
 		draw_text(lx, ty + TILE + 9, ic->label, 0xdfe4f2);
 	}
+
+	for (int i = 0; i < desk_count; i++) {
+		struct deskfile *df = &desk_files[i];
+		int x, y;
+		desk_item_pos(NUM_ICONS + i, &x, &y);
+		int combined = NUM_ICONS + i;
+		int lifted = (icon_press == combined && icon_dragged);
+		int tx = x + (ICON_W - TILE) / 2, ty = y;
+		uint32_t c = df->isdir ? 0x89b4fa : 0x94a3b8;
+
+		fill_round_rect(tx + 2, ty + (lifted ? 7 : 4), TILE, TILE, 18, 0x0c0c14);
+		fill_round_rect_grad(tx, ty, TILE, TILE, 18,
+				     mix(c, 0xffffff, lifted ? 75 : 40),
+				     mix(c, 0x000000, 55));
+		draw_glyph(df->isdir ? G_FOLDER : G_FILE, tx + TILE / 2, ty + TILE / 2,
+			   0xffffff, mix(c, 0x000000, 78));
+		draw_text_clip(x, ty + TILE + 9, df->name, 0xdfe4f2, ICON_W);
+	}
 }
 
 static int icon_at(int px, int py)
@@ -521,7 +586,49 @@ static int icon_at(int px, int py)
 		    py >= ic->y && py < ic->y + ICON_H)
 			return i;
 	}
+	for (int i = desk_count - 1; i >= 0; i--) {
+		int x, y;
+		desk_item_pos(NUM_ICONS + i, &x, &y);
+		if (px >= x && px < x + ICON_W && py >= y && py < y + ICON_H)
+			return NUM_ICONS + i;
+	}
 	return -1;
+}
+
+/* Directories first, then alphabetical -- same ordering as the file manager. */
+static int deskfile_cmp(const void *a, const void *b)
+{
+	const struct deskfile *x = a, *y = b;
+	if (x->isdir != y->isdir)
+		return y->isdir - x->isdir;
+	return strcmp(x->name, y->name);
+}
+
+/* Load the desktop's real directory listing (DESKTOP_DIR) into desk_files. */
+static void desk_scan(void)
+{
+	desk_count = 0;
+	DIR *d = opendir(DESKTOP_DIR);
+	if (!d)
+		return;
+	struct dirent *de;
+	while ((de = readdir(d)) && desk_count < DESK_MAXFILES) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (!show_hidden && de->d_name[0] == '.')
+			continue;
+		if (strlen(de->d_name) >= FM_NAMELEN)
+			continue;
+		struct deskfile *e = &desk_files[desk_count];
+		snprintf(e->name, FM_NAMELEN, "%s", de->d_name);
+		char path[FM_FULLLEN];
+		snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, e->name);
+		struct stat st;
+		e->isdir = (stat(path, &st) == 0) && S_ISDIR(st.st_mode);
+		desk_count++;
+	}
+	closedir(d);
+	qsort(desk_files, desk_count, sizeof(struct deskfile), deskfile_cmp);
 }
 
 /* ---- character-grid terminal model, shared by live terminals and
@@ -799,8 +906,15 @@ static void close_window(int i)
 		drag_win = -1;
 		drag_mode = 0;
 	}
-	if (ctxmenu_win == i)
+	if (ctxmenu_mode == CTXMODE_FILEWIN && ctxmenu_win == i) {
 		ctxmenu_win = -1;
+		ctxmenu_mode = CTXMODE_NONE;
+	}
+	if (fmdrag_win == i) {
+		fmdrag_win = -1;
+		fmdrag_entidx = -1;
+		fmdrag_active = 0;
+	}
 }
 
 static void toggle_maximize(int i)
@@ -1258,10 +1372,40 @@ static void fm_paste(struct window *w)
 	fm_load(w);
 }
 
+/* Paste the clipboard onto the desktop (DESKTOP_DIR). Mirrors fm_paste. */
+static void desk_paste(void)
+{
+	if (!clip_mode)
+		return;
+	const char *base = strrchr(clip_path, '/');
+	base = base ? base + 1 : clip_path;
+	char dest[FM_FULLLEN];
+	snprintf(dest, sizeof(dest), "%s/%s", DESKTOP_DIR, base);
+
+	if (clip_mode == 2) {
+		if (rename(clip_path, dest) == 0)
+			clip_mode = 0;
+	} else {
+		FILE *in = fopen(clip_path, "rb");
+		FILE *out = in ? fopen(dest, "wb") : NULL;
+		if (in && out) {
+			char buf[4096];
+			size_t n;
+			while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+				fwrite(buf, 1, n, out);
+		}
+		if (in) fclose(in);
+		if (out) fclose(out);
+	}
+	desk_scan();
+}
+
 /* Right-click: open the context menu over whichever FILES window (and row,
- * if any) is under the cursor. Closes any menu already open elsewhere. */
+ * if any) is under the cursor, or over the desktop background itself.
+ * Closes any menu already open elsewhere. */
 static void ctxmenu_open(int x, int y)
 {
+	ctxmenu_mode = CTXMODE_NONE;
 	ctxmenu_win = -1;
 	for (int zi = zcount - 1; zi >= 0; zi--) {
 		int i = zorder[zi];
@@ -1284,6 +1428,7 @@ static void ctxmenu_open(int x, int y)
 		}
 		if (entidx >= 0)
 			fm->sel = entidx;
+		ctxmenu_mode = CTXMODE_FILEWIN;
 		ctxmenu_entidx = entidx;
 		ctxmenu_win = i;
 		ctxmenu_x = x;
@@ -1294,6 +1439,22 @@ static void ctxmenu_open(int x, int y)
 		fm_render(w);
 		return;
 	}
+
+	/* Not over any FILES window: the desktop background itself, unless
+	 * the click landed on the taskbar. */
+	if (y < yres - TASK_H) {
+		ctxmenu_mode = CTXMODE_DESKTOP;
+		ctxmenu_deskidx = icon_at(x, y);
+		if (ctxmenu_deskidx < NUM_ICONS)
+			ctxmenu_deskidx = -1; /* fixed app icons aren't file targets */
+		else
+			ctxmenu_deskidx -= NUM_ICONS;
+		ctxmenu_x = x;
+		ctxmenu_y = y;
+		int h = CTX_NITEMS * CTX_ITEMH;
+		if (ctxmenu_x + CTX_W > xres) ctxmenu_x = xres - CTX_W;
+		if (ctxmenu_y + h > yres - TASK_H) ctxmenu_y = yres - TASK_H - h;
+	}
 }
 
 /* Returns 1 if the click landed on the open menu (whether or not it hit an
@@ -1301,62 +1462,99 @@ static void ctxmenu_open(int x, int y)
  * the menu is closed by the caller right after. */
 static int ctxmenu_click(int x, int y)
 {
-	if (ctxmenu_win < 0 || !wins[ctxmenu_win].used)
+	if (ctxmenu_mode == CTXMODE_NONE)
 		return 0;
 	int h = CTX_NITEMS * CTX_ITEMH;
 	if (x < ctxmenu_x || x >= ctxmenu_x + CTX_W || y < ctxmenu_y || y >= ctxmenu_y + h)
 		return 0;
-
 	int idx = (y - ctxmenu_y) / CTX_ITEMH;
-	struct window *w = &wins[ctxmenu_win];
-	struct fmstate *fm = w->fm;
-	struct fent *e = NULL;
-	if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
-		e = &fm->ents[ctxmenu_entidx];
-	int has_target = e && strcmp(e->name, "..");
-	fm->status[0] = 0;
 
-	switch (idx) {
-	case 0: /* Copy */
-		if (has_target && e->isreg) {
-			fm_path(fm, e->name, clip_path, sizeof(clip_path));
-			clip_mode = 1;
-			snprintf(fm->status, sizeof(fm->status), "copied %s", e->name);
-		} else {
-			snprintf(fm->status, sizeof(fm->status), "select a file to copy");
+	if (ctxmenu_mode == CTXMODE_FILEWIN) {
+		if (ctxmenu_win < 0 || !wins[ctxmenu_win].used)
+			return 1;
+		struct window *w = &wins[ctxmenu_win];
+		struct fmstate *fm = w->fm;
+		struct fent *e = NULL;
+		if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
+			e = &fm->ents[ctxmenu_entidx];
+		int has_target = e && strcmp(e->name, "..");
+		fm->status[0] = 0;
+
+		switch (idx) {
+		case 0: /* Copy */
+			if (has_target && e->isreg) {
+				fm_path(fm, e->name, clip_path, sizeof(clip_path));
+				clip_mode = 1;
+				snprintf(fm->status, sizeof(fm->status), "copied %s", e->name);
+			} else {
+				snprintf(fm->status, sizeof(fm->status), "select a file to copy");
+			}
+			break;
+		case 1: /* Cut */
+			if (has_target) {
+				fm_path(fm, e->name, clip_path, sizeof(clip_path));
+				clip_mode = 2;
+				snprintf(fm->status, sizeof(fm->status), "cut %s", e->name);
+			} else {
+				snprintf(fm->status, sizeof(fm->status), "select something to cut");
+			}
+			break;
+		case 2: /* Paste */
+			fm_paste(w);
+			break;
+		case 3: /* Rename */
+			if (has_target) {
+				fm->sel = ctxmenu_entidx;
+				fm->prompt = 3;
+				snprintf(fm->pbuf, sizeof(fm->pbuf), "%s", e->name);
+			} else {
+				snprintf(fm->status, sizeof(fm->status), "select something to rename");
+			}
+			break;
+		case 4: /* Delete */
+			if (has_target) {
+				fm->sel = ctxmenu_entidx;
+				fm_delete(w);
+			} else {
+				snprintf(fm->status, sizeof(fm->status), "select something to delete");
+			}
+			break;
 		}
-		break;
-	case 1: /* Cut */
-		if (has_target) {
-			fm_path(fm, e->name, clip_path, sizeof(clip_path));
-			clip_mode = 2;
-			snprintf(fm->status, sizeof(fm->status), "cut %s", e->name);
-		} else {
-			snprintf(fm->status, sizeof(fm->status), "select something to cut");
+		fm_render(w);
+	} else { /* CTXMODE_DESKTOP */
+		struct deskfile *df = NULL;
+		if (ctxmenu_deskidx >= 0 && ctxmenu_deskidx < desk_count)
+			df = &desk_files[ctxmenu_deskidx];
+
+		switch (idx) {
+		case 0: /* Copy -- files only, same restriction as the file manager */
+			if (df && !df->isdir) {
+				snprintf(clip_path, sizeof(clip_path), "%s/%s", DESKTOP_DIR, df->name);
+				clip_mode = 1;
+			}
+			break;
+		case 1: /* Cut */
+			if (df) {
+				snprintf(clip_path, sizeof(clip_path), "%s/%s", DESKTOP_DIR, df->name);
+				clip_mode = 2;
+			}
+			break;
+		case 2: /* Paste */
+			desk_paste();
+			break;
+		case 3: /* Rename: not supported on the desktop -- ponytail, would
+			 * need its own text-entry prompt outside any window. */
+			break;
+		case 4: /* Delete */
+			if (df) {
+				char path[FM_FULLLEN];
+				snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, df->name);
+				if (df->isdir) rmdir(path); else unlink(path);
+				desk_scan();
+			}
+			break;
 		}
-		break;
-	case 2: /* Paste */
-		fm_paste(w);
-		break;
-	case 3: /* Rename */
-		if (has_target) {
-			fm->sel = ctxmenu_entidx;
-			fm->prompt = 3;
-			snprintf(fm->pbuf, sizeof(fm->pbuf), "%s", e->name);
-		} else {
-			snprintf(fm->status, sizeof(fm->status), "select something to rename");
-		}
-		break;
-	case 4: /* Delete */
-		if (has_target) {
-			fm->sel = ctxmenu_entidx;
-			fm_delete(w);
-		} else {
-			snprintf(fm->status, sizeof(fm->status), "select something to delete");
-		}
-		break;
 	}
-	fm_render(w);
 	return 1;
 }
 
@@ -1388,32 +1586,19 @@ static void fm_toolbar(struct window *w, int btn)
 	}
 }
 
-static void fm_click(struct window *w, int x, int y)
+/* Open the entry at fm->ents[entidx] in window winidx: ".." goes up, a
+ * directory navigates into it, a regular file opens the text editor.
+ * Split out of fm_click so a completed row press-without-drag and a
+ * completed row press-then-drag-then-drop can share it. */
+static void fm_open_selected(int winidx, int entidx)
 {
+	if (winidx < 0 || !wins[winidx].used)
+		return;
+	struct window *w = &wins[winidx];
 	struct fmstate *fm = w->fm;
-	int btn = fm_btn_at(w, x, y);
-	if (btn >= 0) {
-		fm_toolbar(w, btn);
-		fm_render(w);
+	if (entidx < 0 || entidx >= fm->count)
 		return;
-	}
-	fm->status[0] = 0;
-	fm->confirm_del = 0;
-
-	int row = (y - (w->y + TITLE_H + FM_TOOLH)) / font_h;
-	if (row < 0 || row >= w->rows)
-		return;
-	int vi = fm->scroll + row;
-	if (vi < 0 || vi >= fm->vcount)
-		return;
-	int i = fm->view[vi];
-	/* First click selects (so Delete has a target), a second one opens it. */
-	if (fm->sel != i) {
-		fm->sel = i;
-		fm_render(w);
-		return;
-	}
-	struct fent *e = &fm->ents[i];
+	struct fent *e = &fm->ents[entidx];
 
 	if (!strcmp(e->name, "..")) {
 		char *slash = strrchr(fm->cwd, '/');
@@ -1440,6 +1625,136 @@ static void fm_click(struct window *w, int x, int y)
 		/* Regular files only: opening a fifo or char device would block forever. */
 		spawn_editor(path);
 	}
+}
+
+/* Drop the file that was being dragged (fmdrag_win/fmdrag_entidx) at (x,y):
+ * onto a directory row in any FILES window -> move it there; onto the
+ * desktop background -> copy it into DESKTOP_DIR; anywhere else -> no-op. */
+static void fm_drop(int x, int y)
+{
+	if (fmdrag_win < 0 || !wins[fmdrag_win].used)
+		return;
+	struct window *sw = &wins[fmdrag_win];
+	struct fmstate *sfm = sw->fm;
+	if (fmdrag_entidx < 0 || fmdrag_entidx >= sfm->count)
+		return;
+	struct fent *se = &sfm->ents[fmdrag_entidx];
+	if (!strcmp(se->name, ".."))
+		return;
+	char srcpath[FM_FULLLEN];
+	fm_path(sfm, se->name, srcpath, sizeof(srcpath));
+
+	/* Dropped on another (or the same) FILES window's directory row? Move. */
+	for (int zi = zcount - 1; zi >= 0; zi--) {
+		int i = zorder[zi];
+		if (!wins[i].used || wins[i].minimized || wins[i].type != WIN_FILES)
+			continue;
+		struct window *tw = &wins[i];
+		if (x < tw->x || x >= tw->x + tw->w || y < tw->y || y >= tw->y + tw->h)
+			continue;
+
+		struct fmstate *tfm = tw->fm;
+		int content_top = tw->y + TITLE_H + FM_TOOLH;
+		int row = (y - content_top) / font_h;
+		if (row < 0 || row >= tw->rows)
+			return; /* dropped on the titlebar/toolbar: no-op */
+		int vi = tfm->scroll + row;
+		if (vi < 0 || vi >= tfm->vcount)
+			return; /* dropped past the end of the listing: no-op */
+		int ti = tfm->view[vi];
+		struct fent *te = &tfm->ents[ti];
+
+		char destdir[FM_FULLLEN];
+		if (!strcmp(te->name, "..")) {
+			char *slash = strrchr(tfm->cwd, '/');
+			if (slash && slash != tfm->cwd) {
+				size_t n = (size_t)(slash - tfm->cwd);
+				memcpy(destdir, tfm->cwd, n);
+				destdir[n] = 0;
+			} else {
+				strcpy(destdir, "/");
+			}
+		} else if (te->isdir) {
+			fm_path(tfm, te->name, destdir, sizeof(destdir));
+		} else {
+			return; /* dropped onto a file row: no-op */
+		}
+
+		char dest[FM_FULLLEN];
+		snprintf(dest, sizeof(dest), "%s%s%s", destdir,
+			 strcmp(destdir, "/") ? "/" : "", se->name);
+		if (!strcmp(srcpath, dest))
+			return; /* dropped onto its own folder */
+		if (rename(srcpath, dest) == 0)
+			snprintf(sfm->status, sizeof(sfm->status), "moved %s", se->name);
+		else
+			snprintf(sfm->status, sizeof(sfm->status), "move failed: %s", strerror(errno));
+		fm_load(sw);
+		if (tw != sw)
+			fm_load(tw);
+		return;
+	}
+
+	/* Not over any FILES window: the desktop, if it's not the taskbar.
+	 * Files only -- same restriction as fm_paste's Copy. */
+	if (y < yres - TASK_H) {
+		if (se->isdir) {
+			snprintf(sfm->status, sizeof(sfm->status), "cannot copy directories to desktop");
+			fm_render(sw);
+			return;
+		}
+		char dest[FM_FULLLEN];
+		snprintf(dest, sizeof(dest), "%s/%s", DESKTOP_DIR, se->name);
+		FILE *in = fopen(srcpath, "rb");
+		FILE *out = in ? fopen(dest, "wb") : NULL;
+		if (in && out) {
+			char buf[4096];
+			size_t n;
+			while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+				fwrite(buf, 1, n, out);
+			snprintf(sfm->status, sizeof(sfm->status), "copied %s to desktop", se->name);
+			desk_scan();
+		} else {
+			snprintf(sfm->status, sizeof(sfm->status), "copy failed: %s", strerror(errno));
+		}
+		if (in) fclose(in);
+		if (out) fclose(out);
+		fm_render(sw);
+	}
+}
+
+static void fm_click(struct window *w, int x, int y)
+{
+	struct fmstate *fm = w->fm;
+	int btn = fm_btn_at(w, x, y);
+	if (btn >= 0) {
+		fm_toolbar(w, btn);
+		fm_render(w);
+		return;
+	}
+	fm->status[0] = 0;
+	fm->confirm_del = 0;
+
+	int row = (y - (w->y + TITLE_H + FM_TOOLH)) / font_h;
+	if (row < 0 || row >= w->rows)
+		return;
+	int vi = fm->scroll + row;
+	if (vi < 0 || vi >= fm->vcount)
+		return;
+	int i = fm->view[vi];
+
+	/* Arm this row as a drag candidate; motion past a threshold turns it
+	 * into a drag (handled in process_pointer). If it never moved, the
+	 * release replays today's click semantics: first click selects,
+	 * a second click on an already-selected row opens it. */
+	fmdrag_win = (int)(w - wins);
+	fmdrag_entidx = i;
+	fmdrag_active = 0;
+	fmdrag_grab_x = x;
+	fmdrag_grab_y = y;
+	fmdrag_was_preselected = (fm->sel == i);
+	fm->sel = i;
+	fm_render(w);
 }
 
 /* While a New File / New Dir / Rename prompt is open, keys go into the name
@@ -2185,27 +2500,58 @@ static void cycle_window_focus(void)
 
 static void draw_ctxmenu(void)
 {
-	if (ctxmenu_win < 0 || !wins[ctxmenu_win].used) {
-		ctxmenu_win = -1;
+	if (ctxmenu_mode == CTXMODE_NONE)
 		return;
-	}
-	struct fmstate *fm = wins[ctxmenu_win].fm;
-	struct fent *e = NULL;
-	if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
-		e = &fm->ents[ctxmenu_entidx];
-	int has_target = e && strcmp(e->name, "..");
-	int h = CTX_NITEMS * CTX_ITEMH;
 
+	int has_target, target_isreg;
+	if (ctxmenu_mode == CTXMODE_FILEWIN) {
+		if (ctxmenu_win < 0 || !wins[ctxmenu_win].used) {
+			ctxmenu_mode = CTXMODE_NONE;
+			return;
+		}
+		struct fmstate *fm = wins[ctxmenu_win].fm;
+		struct fent *e = NULL;
+		if (ctxmenu_entidx >= 0 && ctxmenu_entidx < fm->count)
+			e = &fm->ents[ctxmenu_entidx];
+		has_target = e && strcmp(e->name, "..");
+		target_isreg = has_target && e->isreg;
+	} else {
+		struct deskfile *df = NULL;
+		if (ctxmenu_deskidx >= 0 && ctxmenu_deskidx < desk_count)
+			df = &desk_files[ctxmenu_deskidx];
+		has_target = df != NULL;
+		target_isreg = df && !df->isdir;
+	}
+
+	int h = CTX_NITEMS * CTX_ITEMH;
 	fill_round_rect(ctxmenu_x + 3, ctxmenu_y + 4, CTX_W, h, 6, 0x0a0a11);
 	fill_round_rect(ctxmenu_x, ctxmenu_y, CTX_W, h, 6, 0x2e2e3c);
 	for (int i = 0; i < CTX_NITEMS; i++) {
 		int iy = ctxmenu_y + i * CTX_ITEMH;
-		int enabled = (i == 2) ? clip_mode
-			     : (i == 0) ? (has_target && e->isreg)
-			     : has_target;
+		int enabled;
+		if (i == 2) enabled = clip_mode;                                /* Paste */
+		else if (i == 0) enabled = target_isreg;                        /* Copy */
+		else if (i == 3) enabled = has_target && ctxmenu_mode == CTXMODE_FILEWIN; /* Rename */
+		else enabled = has_target;                                      /* Cut, Delete */
 		draw_text(ctxmenu_x + 10, iy + (CTX_ITEMH - font_h) / 2,
 			  ctx_items[i], enabled ? 0xdfe4f2 : 0x585b70);
 	}
+}
+
+/* While a file manager row is being dragged, show its name near the cursor
+ * so the user can see what they're carrying and where it'll land. */
+static void draw_fmdrag(void)
+{
+	if (fmdrag_win < 0 || !fmdrag_active || !wins[fmdrag_win].used)
+		return;
+	struct fmstate *fm = wins[fmdrag_win].fm;
+	if (fmdrag_entidx < 0 || fmdrag_entidx >= fm->count)
+		return;
+	const char *name = fm->ents[fmdrag_entidx].name;
+	int w = (int)strlen(name) * font_w + 16;
+	fill_round_rect(mx + 15, my + 15, w, font_h + 8, 4, 0x0a0a11);
+	fill_round_rect(mx + 14, my + 14, w, font_h + 8, 4, 0x313244);
+	draw_text(mx + 22, my + 18, name, 0xf9e2af);
 }
 
 static void redraw_all(void)
@@ -2220,6 +2566,7 @@ static void redraw_all(void)
 	}
 	draw_taskbar();
 	draw_ctxmenu();
+	draw_fmdrag();
 	draw_cursor(mx, my);
 	if (backbuf)
 		memcpy(fbp, backbuf, (size_t)line_length * yres);
@@ -2303,10 +2650,11 @@ static void do_hit_test(int x, int y)
 						theme_idx = t;
 					} else if (t == NUM_THEMES) {
 						show_hidden = !show_hidden;
-						/* Reload all open file windows to show/hide .* files */
+						/* Reload all open file windows and the desktop to show/hide .* files */
 						for (int i = 0; i < MAX_WIN; i++)
 							if (wins[i].used && wins[i].type == WIN_FILES && wins[i].fm)
 								fm_load(&wins[i]);
+						desk_scan();
 					}
 				} else if (w->type == WIN_TASKMGR) {
 					int t = taskmgr_tab_at(w, x, y);
@@ -2321,13 +2669,19 @@ static void do_hit_test(int x, int y)
 	}
 
 	/* Press on an icon only *selects* it. It launches on release if the
-	 * pointer never moved; otherwise the motion turns into a drag. */
+	 * pointer never moved; otherwise the motion turns into a drag.
+	 * Indices >= NUM_ICONS are desktop files: same press/drag/release
+	 * state machine, but their position is fixed (grid-computed), not
+	 * draggable, so a "drag" on one just cancels the open. */
 	int idx = icon_at(x, y);
 	if (idx >= 0) {
 		icon_press = idx;
 		icon_dragged = 0;
-		icon_grab_dx = x - icons[idx].x;
-		icon_grab_dy = y - icons[idx].y;
+		int ix, iy;
+		if (idx < NUM_ICONS) { ix = icons[idx].x; iy = icons[idx].y; }
+		else desk_item_pos(idx, &ix, &iy);
+		icon_grab_dx = x - ix;
+		icon_grab_dy = y - iy;
 	}
 }
 
@@ -2350,6 +2704,26 @@ static void launch_icon(int idx)
 		spawn_taskmgr();
 	} else if (ic->action == 6) {
 		spawn_settings();
+	}
+}
+
+/* Opening a desktop icon: a folder opens a File Manager rooted there, a
+ * file opens the text editor -- same as double-clicking it in File Manager. */
+static void launch_deskfile(int i)
+{
+	if (i < 0 || i >= desk_count)
+		return;
+	struct deskfile *df = &desk_files[i];
+	char path[FM_FULLLEN];
+	snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, df->name);
+	if (df->isdir) {
+		int slot = spawn_file_window();
+		if (slot >= 0) {
+			snprintf(wins[slot].fm->cwd, sizeof(wins[slot].fm->cwd), "%s", path);
+			fm_load(&wins[slot]);
+		}
+	} else {
+		spawn_editor(path);
 	}
 }
 
@@ -2379,25 +2753,38 @@ static int process_pointer(int nx, int ny, int left, int right)
 		resize_notify(&wins[drag_win]);
 		changed = 1;
 	} else if (left && prev_left && icon_press >= 0) {
-		/* Past a few pixels of travel this is a drag, not a click. */
+		/* Past a few pixels of travel this is a drag, not a click.
+		 * Desktop files (idx >= NUM_ICONS) have a fixed, grid-computed
+		 * position -- dragging one just cancels the open, it doesn't move. */
+		int ix, iy;
+		if (icon_press < NUM_ICONS) { ix = icons[icon_press].x; iy = icons[icon_press].y; }
+		else desk_item_pos(icon_press, &ix, &iy);
 		if (!icon_dragged && (dx * dx + dy * dy) > 0) {
-			int tx = mx - icon_grab_dx - icons[icon_press].x;
-			int ty = my - icon_grab_dy - icons[icon_press].y;
+			int tx = mx - icon_grab_dx - ix;
+			int ty = my - icon_grab_dy - iy;
 			if (tx * tx + ty * ty > 9)
 				icon_dragged = 1;
 		}
-		if (icon_dragged) {
+		if (icon_dragged && icon_press < NUM_ICONS) {
 			icons[icon_press].x = mx - icon_grab_dx;
 			icons[icon_press].y = my - icon_grab_dy;
 			clamp_icon(&icons[icon_press]);
 			changed = 1;
 		}
+	} else if (left && prev_left && fmdrag_win >= 0 && !fmdrag_active) {
+		/* Same drag-threshold pattern for a pressed file manager row. */
+		if ((dx * dx + dy * dy) > 0) {
+			int tx = mx - fmdrag_grab_x, ty = my - fmdrag_grab_y;
+			if (tx * tx + ty * ty > 9)
+				fmdrag_active = 1;
+		}
+		changed = 1;
 	} else if (left && !prev_left) {
 		/* An open context menu eats the next click: on it, run the item;
 		 * off it, dismiss it and let the click through to the desktop. */
-		if (ctxmenu_win >= 0) {
+		if (ctxmenu_mode != CTXMODE_NONE) {
 			int handled = ctxmenu_click(mx, my);
-			ctxmenu_win = -1;
+			ctxmenu_mode = CTXMODE_NONE;
 			if (!handled)
 				do_hit_test(mx, my);
 		} else {
@@ -2414,8 +2801,21 @@ static int process_pointer(int nx, int ny, int left, int right)
 			int was_drag = icon_dragged;
 			icon_press = -1;
 			icon_dragged = 0;
-			if (!was_drag)
-				launch_icon(idx); /* a click that never moved */
+			if (!was_drag) { /* a click that never moved */
+				if (idx < NUM_ICONS)
+					launch_icon(idx);
+				else
+					launch_deskfile(idx - NUM_ICONS);
+			}
+		}
+		if (fmdrag_win >= 0) {
+			if (fmdrag_active)
+				fm_drop(mx, my);
+			else if (fmdrag_was_preselected)
+				fm_open_selected(fmdrag_win, fmdrag_entidx);
+			fmdrag_win = -1;
+			fmdrag_entidx = -1;
+			fmdrag_active = 0;
 		}
 		changed = 1;
 	}
@@ -2616,6 +3016,8 @@ int main(void)
 		xres, yres, bpp, have_font, font_w, font_h);
 
 	init_icon_positions(); /* needs xres/yres; without it every icon sits at 0,0 */
+	mkdir(DESKTOP_DIR, 0755); /* ignore EEXIST -- it's fine if it's already there */
+	desk_scan();
 
 	open_input_devices();
 	/* Only fall back to relative PS/2 mouse when no absolute tablet exists,
@@ -2675,6 +3077,11 @@ int main(void)
 			for (int i = 0; i < MAX_WIN; i++)
 				if (wins[i].used && wins[i].type == WIN_TASKMGR && !wins[i].minimized)
 					taskmgr_refresh(&wins[i]);
+			/* Pick up files added/removed in DESKTOP_DIR from outside this
+			 * app (a terminal, another program) -- skip mid-interaction so
+			 * indices an active press/menu is holding don't shift under it. */
+			if (icon_press < 0 && ctxmenu_mode != CTXMODE_DESKTOP)
+				desk_scan();
 			redraw_all();
 			continue;
 		}
