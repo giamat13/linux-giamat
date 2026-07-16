@@ -181,6 +181,24 @@ struct fmstate {
 /* Text editor state, allocated only for WIN_EDIT windows. */
 #define ED_MAXLINES 1024
 #define ED_MAXCOL 240
+/* toolbar (Save/Undo/Redo) above the text, status bar (Ln/Col) below it */
+#define ED_TOOLH 28
+#define ED_STATH 22
+#define ED_NBTN 3
+#define ED_BTNW 76
+#define ED_UNDO 32
+
+/* One undo/redo step: a copy of the whole buffer plus the caret it had.
+ * ponytail: full-buffer snapshots (lines are malloc'd to the used size, so a
+ * small file costs little). Move to per-op deltas only if big files hurt. */
+struct edsnap {
+	char (*line)[ED_MAXCOL];
+	int nlines, cy, cx;
+};
+
+/* Consecutive same-kind edits on one line coalesce into a single undo step --
+ * without it a 32-deep stack would only reach back 32 keystrokes. */
+enum edop { OP_NONE, OP_INSERT, OP_DELETE, OP_OTHER };
 
 struct edstate {
 	char path[FM_FULLLEN];
@@ -191,6 +209,10 @@ struct edstate {
 	int dirty;
 	int truncated; /* file didn't fit: refuse to save over it */
 	char status[64];
+
+	struct edsnap undo[ED_UNDO], redo[ED_UNDO];
+	int nundo, nredo;
+	int last_op, last_cy; /* coalescing state, see enum edop */
 };
 
 struct window {
@@ -371,7 +393,9 @@ void fm_render(struct window *w);
 int spawn_file_window(void);
 
 /* editor.c */
+void draw_editor(struct window *w, int content_y, int content_h);
 void ed_click(struct window *w, int x, int y);
+void ed_free(struct edstate *e);
 int ed_keys(struct window *w, const char *buf, int n);
 void ed_render(struct window *w);
 int spawn_editor(const char *path);

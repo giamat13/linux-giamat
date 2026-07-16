@@ -34,6 +34,7 @@ void close_window(int i)
 		wins[i].fm = NULL;
 	}
 	if (wins[i].ed) {
+		ed_free(wins[i].ed);
 		free(wins[i].ed);
 		wins[i].ed = NULL;
 	}
@@ -150,6 +151,12 @@ void draw_window(struct window *w)
 		return;
 	}
 
+	/* text editor draws its own toolbar + gutter + status bar (no grid) */
+	if (w->type == WIN_EDIT && w->ed) {
+		draw_editor(w, content_y, content_h);
+		return;
+	}
+
 	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);
 
 	for (int r = 0; r < w->rows; r++) {
@@ -168,7 +175,7 @@ void draw_window(struct window *w)
 				blit_char(w->x + 4 + c * font_w, ry, ch, w->gfg[r][c]);
 		}
 	}
-	if (w->type == WIN_TERM || w->type == WIN_EDIT) {
+	if (w->type == WIN_TERM) {
 		int bx = w->x + 4 + w->cur_col * font_w;
 		int by = content_y + w->cur_row * font_h + font_h - 2;
 		fill_rect(bx, by, font_w, 2, 0xf9e2af);

@@ -202,3 +202,7 @@ sphinx_*/
 *.iso
 # Build artifacts: the ISO is ~300MB, it does not belong in git
 /dist/
+
+# Development scripts
+restart.ps1
+restart.sh
