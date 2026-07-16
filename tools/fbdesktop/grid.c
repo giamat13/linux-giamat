@@ -10,11 +10,6 @@ void update_grid_dims(struct window *w)
 	int content_h = w->h - TITLE_H;
 	if (w->type == WIN_FILES)
 		content_h -= FM_TOOLH;
-	if (w->type == WIN_TASKMGR) {
-		content_h -= TM_TABH;
-		if (w->tab == 1)
-			content_h -= TM_GRAPH_H; /* graphs sit above the text */
-	}
 	int newcols = (w->w - 8) / font_w;
 	int newrows = content_h / font_h;
 	if (newcols > GRID_MAXCOLS) newcols = GRID_MAXCOLS;

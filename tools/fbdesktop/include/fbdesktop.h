@@ -107,15 +107,13 @@ struct theme {
 
 /* One-second samples of CPU / memory use, oldest first. */
 #define HIST 60
-#define TM_GRAPH_H 120
 
-/* Task Manager tabs -- one window, Windows-style, auto-refreshing. */
+/* Task Manager sidebar views. */
 struct tmtab {
 	const char *label;
 	const char *cmd;
 };
-#define TM_NTABS 5
-#define TM_TABH 26
+#define TM_NTABS 4
 
 /* File manager state, allocated only for WIN_FILES windows. */
 #define FM_MAXENT 512
@@ -351,10 +349,11 @@ int spawn_browser(void);
 /* taskmgr.c */
 void draw_graph(int x, int y, int w, int h, const int *hist,
 		uint32_t col, const char *label);
+void draw_taskmgr(struct window *w, int content_y, int content_h);
 void sample_stats(void);
 int spawn_taskmgr(void);
 void taskmgr_refresh(struct window *w);
-int taskmgr_tab_at(struct window *w, int px, int py);
+void taskmgr_click(struct window *w, int px, int py);
 
 /* files.c */
 int ctxmenu_click(int x, int y);

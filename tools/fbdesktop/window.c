@@ -176,34 +176,10 @@ void draw_window(struct window *w)
 		content_h -= FM_TOOLH;
 	}
 
-	/* task-manager tab strip sits between titlebar and content */
+	/* task manager draws its own sidebar + panels (no grid) */
 	if (w->type == WIN_TASKMGR) {
-		int tw = w->w / TM_NTABS;
-		fill_rect(w->x, content_y, w->w, TM_TABH, 0x181826);
-		for (int t = 0; t < TM_NTABS; t++) {
-			int tx = w->x + t * tw;
-			int on = (t == w->tab);
-			fill_rect(tx, content_y, tw - 1, TM_TABH,
-				  on ? COL_BG_DEFAULT : 0x232338);
-			if (on)
-				fill_rect(tx, content_y, tw - 1, 2, win_accent(w));
-			int lw = (int)strlen(tm_tabs[t].label) * font_w;
-			draw_text_clip(tx + (tw - lw) / 2,
-				       content_y + (TM_TABH - font_h) / 2,
-				       tm_tabs[t].label,
-				       on ? 0xffffff : 0x9399b2, tw - 6);
-		}
-		content_y += TM_TABH;
-		content_h -= TM_TABH;
-
-		if (w->tab == 1 && content_h > TM_GRAPH_H) {
-			fill_rect(w->x, content_y, w->w, TM_GRAPH_H, COL_BG_DEFAULT);
-			int gw = (w->w - 24) / 2, gh = TM_GRAPH_H - 16;
-			draw_graph(w->x + 8, content_y + 8, gw, gh, cpu_hist, 0x89b4fa, "CPU");
-			draw_graph(w->x + 16 + gw, content_y + 8, gw, gh, mem_hist, 0xa6e3a1, "MEM");
-			content_y += TM_GRAPH_H;
-			content_h -= TM_GRAPH_H;
-		}
+		draw_taskmgr(w, content_y, content_h);
+		return;
 	}
 
 	fill_rect(w->x, content_y, w->w, content_h, COL_BG_DEFAULT);

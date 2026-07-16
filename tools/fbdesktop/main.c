@@ -79,11 +79,7 @@ static void do_hit_test(int x, int y)
 						desk_scan();
 					}
 				} else if (w->type == WIN_TASKMGR) {
-					int t = taskmgr_tab_at(w, x, y);
-					if (t >= 0 && t != w->tab) {
-						w->tab = t;
-						taskmgr_refresh(w);
-					}
+					taskmgr_click(w, x, y);
 				}
 				return;
 			}

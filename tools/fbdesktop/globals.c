@@ -22,11 +22,10 @@ const struct theme themes[NUM_THEMES] = {
 };
 
 const struct tmtab tm_tabs[TM_NTABS] = {
-	{"Processes",   "ps"},
-	{"Performance", "free -m; echo; head -8 /proc/meminfo; echo; uptime"},
-	{"Disk",        "df -h"},
-	{"System",      "uname -a; echo; uptime; echo; head -1 /proc/version"},
-	{"Dmesg",       "dmesg | tail -40"},
+	{"Processes",   NULL},
+	{"Performance", NULL},
+	{"Disk",        NULL},
+	{"System",      NULL},
 };
 
 const char *ctx_items[CTX_NITEMS] = { "Copy", "Cut", "Paste", "Rename", "Delete" };
