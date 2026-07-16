@@ -80,6 +80,12 @@ static void do_hit_test(int x, int y)
 					}
 				} else if (w->type == WIN_TASKMGR) {
 					taskmgr_click(w, x, y);
+				} else if (w->type == WIN_CALC) {
+					calc_click(w, x, y);
+				} else if (w->type == WIN_PAINT) {
+					paint_click(w, x, y);
+				} else if (w->type == WIN_CAL) {
+					cal_click(w, x, y);
 				}
 				return;
 			}
@@ -124,6 +130,12 @@ static void launch_icon(int idx)
 		spawn_taskmgr();
 	} else if (ic->action == 6) {
 		spawn_settings();
+	} else if (ic->action == 8) {
+		spawn_calc();
+	} else if (ic->action == 9) {
+		spawn_paint();
+	} else if (ic->action == 10) {
+		spawn_cal();
 	}
 }
 
@@ -208,6 +220,11 @@ int process_pointer(int nx, int ny, int left, int right)
 			clamp_icon(&icons[icon_press]);
 			changed = 1;
 		}
+	} else if (left && prev_left && paint_win >= 0) {
+		/* A canvas that captured the press keeps the pointer until release,
+		 * so a stroke that wanders off the canvas and back stays one stroke. */
+		paint_motion(mx, my);
+		changed = 1;
 	} else if (left && prev_left && fmdrag_win >= 0 && !fmdrag_active) {
 		/* Same drag-threshold pattern for a pressed file manager row. */
 		if ((dx * dx + dy * dy) > 0) {
@@ -254,6 +271,7 @@ int process_pointer(int nx, int ny, int left, int right)
 			fmdrag_entidx = -1;
 			fmdrag_active = 0;
 		}
+		paint_win = -1;
 		changed = 1;
 	}
 	if (left != prev_left)
@@ -568,6 +586,15 @@ int main(void)
 					need_redraw = 1;
 				else if (wins[focused].type == WIN_FILES &&
 					 fm_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+				else if (wins[focused].type == WIN_CALC &&
+					 calc_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+				else if (wins[focused].type == WIN_PAINT &&
+					 paint_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+				else if (wins[focused].type == WIN_CAL &&
+					 cal_keys(&wins[focused], buf, r))
 					need_redraw = 1;
 			}
 		}

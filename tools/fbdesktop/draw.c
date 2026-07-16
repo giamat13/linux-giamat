@@ -276,6 +276,31 @@ void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		fill_round_rect(cx - 18, cy - 16, 36, 32, 6, fg);
 		fill_triangle(cx - 4, cy, 9, 3, hole);
 		break;
+	case G_CALC:
+		/* a keypad body: display strip on top, four rows of keys */
+		fill_round_rect(cx - 15, cy - 20, 30, 40, 4, fg);
+		fill_round_rect(cx - 11, cy - 16, 22, 7, 2, hole);
+		for (int r = 0; r < 3; r++)
+			for (int c = 0; c < 3; c++)
+				fill_round_rect(cx - 11 + c * 8, cy - 5 + r * 8, 5, 5, 1, hole);
+		break;
+	case G_PAINT:
+		/* a brush: angled ferrule and handle, with a paint blob at the tip */
+		fill_circle(cx - 9, cy + 11, 6, fg);
+		fill_round_rect(cx - 4, cy - 20, 9, 22, 3, fg);
+		fill_rect(cx - 4, cy - 4, 9, 4, hole);
+		fill_round_rect(cx - 6, cy, 13, 7, 2, fg);
+		break;
+	case G_CAL:
+		/* a wall calendar: two hanging rings, a header band, a grid of days */
+		fill_round_rect(cx - 5, cy - 21, 4, 8, 2, fg);
+		fill_round_rect(cx + 1, cy - 21, 4, 8, 2, fg);
+		fill_round_rect(cx - 18, cy - 16, 36, 34, 4, fg);
+		fill_rect(cx - 18, cy - 7, 36, 2, hole);
+		for (int r = 0; r < 2; r++)
+			for (int c = 0; c < 4; c++)
+				fill_rect(cx - 13 + c * 7, cy - 2 + r * 8, 4, 4, hole);
+		break;
 	default:
 		break;
 	}

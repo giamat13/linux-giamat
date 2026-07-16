@@ -38,6 +38,20 @@ void close_window(int i)
 		free(wins[i].ed);
 		wins[i].ed = NULL;
 	}
+	if (wins[i].calc) {
+		free(wins[i].calc);
+		wins[i].calc = NULL;
+	}
+	if (wins[i].paint) {
+		if (paint_win == i)
+			paint_win = -1; /* a stroke can't outlive its canvas */
+		free(wins[i].paint);
+		wins[i].paint = NULL;
+	}
+	if (wins[i].cal) {
+		free(wins[i].cal);
+		wins[i].cal = NULL;
+	}
 	wins[i].used = 0;
 	for (int zi = 0; zi < zcount; zi++) {
 		if (zorder[zi] == i) {
@@ -154,6 +168,21 @@ void draw_window(struct window *w)
 	/* text editor draws its own toolbar + gutter + status bar (no grid) */
 	if (w->type == WIN_EDIT && w->ed) {
 		draw_editor(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_CALC && w->calc) {
+		draw_calc(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_PAINT && w->paint) {
+		draw_paint(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_CAL && w->cal) {
+		draw_cal(w, content_y, content_h);
 		return;
 	}
 

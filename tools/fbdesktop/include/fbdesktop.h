@@ -73,11 +73,12 @@
 #define COL_FG_DEFAULT 0xcdd6f4
 #define COL_BG_DEFAULT 0x1e1e2e
 
-enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS, WIN_BROWSER };
+enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS,
+	       WIN_BROWSER, WIN_CALC, WIN_PAINT, WIN_CAL };
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
-	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC, G_GLOBE
+	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC, G_GLOBE, G_CALC, G_PAINT, G_CAL
 };
 
 /* File-type classification by extension -- drives the icon/tag/color shown
@@ -91,11 +92,12 @@ struct icon {
 	const char *label;
 	const char *cmd;
 	uint32_t color;
-	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,6=settings,7=X app */
+	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,
+		     * 6=settings,7=X app,8=calculator,9=paint,10=calendar */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
-#define NUM_ICONS 7
+#define NUM_ICONS 10
 
 /* Desktop themes -- the only setting that has any effect at runtime; the
  * framebuffer mode itself is fixed by GRUB's gfxpayload at boot. */
@@ -215,6 +217,65 @@ struct edstate {
 	int last_op, last_cy; /* coalescing state, see enum edop */
 };
 
+/* Calculator state, allocated only for WIN_CALC windows. An immediate-execution
+ * calculator (what a physical one does), not an expression parser: there is one
+ * accumulator and one pending operator. */
+#define CALC_COLS 4
+#define CALC_ROWS 5
+#define CALC_DISPH 64
+
+struct calcstate {
+	char entry[32];  /* the number currently being typed */
+	double acc;      /* accumulator, folded in on every operator */
+	char op;         /* pending operator, 0 = none */
+	int fresh;       /* next digit replaces entry rather than appending */
+	int err;         /* division by zero: display locks until C */
+	char expr[48];   /* the dim history line above the entry */
+};
+
+/* Paint state, allocated only for WIN_PAINT windows. A fixed logical pixel
+ * canvas drawn at an integer zoom -- the pixels are the point. */
+#define PT_W 128
+#define PT_H 96
+#define PT_NCOL 16
+#define PT_TOOLH 30
+#define PT_PALH 30
+#define PT_NTOOL 5      /* pencil, eraser, fill, clear, save */
+
+struct paintstate {
+	uint8_t px[PT_H][PT_W]; /* palette indices; 0 is the empty/white paper */
+	int color;              /* active palette index */
+	int tool;               /* 0 pencil, 1 eraser, 2 fill */
+	int brush;              /* radius knob, 1..3 */
+	int last_x, last_y;     /* previous canvas cell, for stroke interpolation */
+	char status[48];
+};
+
+/* Calendar state, allocated only for WIN_CAL windows. A month grid plus the
+ * events of the selected day, persisted as one line per event in CAL_FILE. */
+#define CAL_HEADH 36
+#define CAL_WDH 22
+#define CAL_PANW 224
+#define CAL_MAXEV 256
+#define CAL_TEXTLEN 64
+#define CAL_FILE "/root/.calendar"
+
+struct calevent {
+	int y, m, d;              /* m is 1..12 */
+	char text[CAL_TEXTLEN];
+};
+
+struct calstate {
+	int year, month;          /* the month on display, month 1..12 */
+	int sy, sm, sd;           /* the selected day */
+	struct calevent ev[CAL_MAXEV];
+	int nev;
+	int sel_ev;               /* index into the selected day's list, -1 = none */
+	char input[CAL_TEXTLEN];
+	int typing;               /* keys are going into input[] */
+	char status[48];
+};
+
 struct window {
 	int used;
 	enum wintype type;
@@ -225,9 +286,12 @@ struct window {
 
 	int pty_fd;
 	pid_t pid;
-	struct fmstate *fm; /* WIN_FILES only */
-	struct edstate *ed; /* WIN_EDIT only */
-	int tab;            /* WIN_TASKMGR: active tab */
+	struct fmstate *fm;       /* WIN_FILES only */
+	struct edstate *ed;       /* WIN_EDIT only */
+	struct calcstate *calc;   /* WIN_CALC only */
+	struct paintstate *paint; /* WIN_PAINT only */
+	struct calstate *cal;     /* WIN_CAL only */
+	int tab;                  /* WIN_TASKMGR: active tab */
 
 	int cols, rows;
 	unsigned char gch[GRID_MAXROWS][GRID_MAXCOLS];
@@ -404,6 +468,28 @@ int spawn_editor(const char *path);
 void draw_settings(struct window *w, int content_y);
 int settings_click(struct window *w, int px, int py);
 int spawn_settings(void);
+
+/* calc.c */
+void calc_click(struct window *w, int px, int py);
+int calc_keys(struct window *w, const char *buf, int n);
+void draw_calc(struct window *w, int content_y, int content_h);
+int spawn_calc(void);
+
+/* paint.c */
+void draw_paint(struct window *w, int content_y, int content_h);
+void paint_click(struct window *w, int px, int py);
+int paint_keys(struct window *w, const char *buf, int n);
+void paint_motion(int px, int py);
+int spawn_paint(void);
+/* Window slot whose canvas has the pointer captured for a stroke, -1 = none.
+ * Same press/motion/release shape as the file-manager row drag. */
+extern int paint_win;
+
+/* calendar.c */
+void cal_click(struct window *w, int px, int py);
+int cal_keys(struct window *w, const char *buf, int n);
+void draw_cal(struct window *w, int content_y, int content_h);
+int spawn_cal(void);
 
 /* main.c */
 int process_pointer(int nx, int ny, int left, int right);
