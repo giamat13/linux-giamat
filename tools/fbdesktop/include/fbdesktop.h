@@ -170,6 +170,9 @@ struct fmstate {
 #define FM_TOOLH 28
 #define FM_NBTN 4
 #define FM_BTNW 96
+/* listing: a column-header strip, then icon rows font_h+FM_ROWPAD tall */
+#define FM_HEADH 22
+#define FM_ROWPAD 10
 
 /* "Show desktop" button: minimize everything, click again to bring it all
  * back. Sits at the far right of the taskbar, to the right of the clock. */
@@ -358,6 +361,7 @@ void taskmgr_click(struct window *w, int px, int py);
 /* files.c */
 int ctxmenu_click(int x, int y);
 void ctxmenu_open(int x, int y);
+void draw_files(struct window *w, int content_y, int content_h);
 void fm_click(struct window *w, int x, int y);
 void fm_drop(int x, int y);
 int fm_keys(struct window *w, const char *buf, int n);

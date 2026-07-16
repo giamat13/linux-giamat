@@ -4,13 +4,22 @@
 
 /* ---- file manager ---- */
 
-static void fm_puts(struct window *w, int row, int col, const char *s, uint32_t fg)
+/* Listing geometry, shared by the renderer and every hit-test below so a click
+ * lands on the row it visually points at. */
+static int fm_rowh(void)          { return font_h + FM_ROWPAD; }
+static int fm_list_top(struct window *w) { return w->y + TITLE_H + FM_TOOLH + FM_HEADH; }
+static int fm_visible_rows(struct window *w)
 {
-	for (int i = 0; s[i] && col + i < w->cols; i++) {
-		w->gch[row][col + i] = (unsigned char)s[i];
-		w->gfg[row][col + i] = fg;
-		w->gbg[row][col + i] = COL_BG_DEFAULT;
-	}
+	int h = w->h - TITLE_H - FM_TOOLH - FM_HEADH;
+	return h > 0 ? h / fm_rowh() : 0;
+}
+/* Map a pixel y inside a FILES window to a listing row index, or -1. */
+static int fm_row_at(struct window *w, int y)
+{
+	int r = (y - fm_list_top(w)) / fm_rowh();
+	if (r < 0 || r >= fm_visible_rows(w))
+		return -1;
+	return r;
 }
 
 /* Case-insensitive substring test. */
@@ -41,49 +50,15 @@ static void fm_apply_filter(struct fmstate *fm)
 	}
 }
 
+/* Kept as the "the listing state changed, reclamp scroll" hook every caller
+ * already invokes; the pixels are drawn live by draw_files each frame. */
 void fm_render(struct window *w)
 {
 	struct fmstate *fm = w->fm;
-	int maxscroll = fm->vcount - w->rows;
+	int maxscroll = fm->vcount - fm_visible_rows(w);
 	if (maxscroll < 0) maxscroll = 0;
 	if (fm->scroll > maxscroll) fm->scroll = maxscroll;
 	if (fm->scroll < 0) fm->scroll = 0;
-
-	for (int r = 0; r < w->rows; r++)
-		clear_row_range(w, r, 0, w->cols - 1);
-
-	for (int r = 0; r < w->rows; r++) {
-		int vi = fm->scroll + r;
-		if (vi >= fm->vcount)
-			break;
-		int i = fm->view[vi];
-		struct fent *e = &fm->ents[i];
-		enum fcat cat = classify_file(e->name, e->isdir, e->isexec);
-		char line[FM_NAMELEN + 16];
-		snprintf(line, sizeof(line), "%s %s", fcat_tag(cat), e->name);
-		/* Hidden files appear dimmed (starts with .); otherwise images,
-		 * archives, code, executables, and directories get their category
-		 * color -- plain text/unrecognized files keep the normal foreground. */
-		int is_hidden = (e->name[0] == '.');
-		uint32_t color;
-		if (is_hidden)
-			color = 0x6c7086;
-		else if (cat == FCAT_TEXT || cat == FCAT_OTHER)
-			color = COL_FG_DEFAULT;
-		else
-			color = fcat_color(cat);
-		fm_puts(w, r, 0, line, color);
-		if (e->isreg) {
-			char sz[24];
-			snprintf(sz, sizeof(sz), "%ld", e->size);
-			int col = w->cols - (int)strlen(sz) - 1;
-			if (col > (int)strlen(line) + 1)
-				fm_puts(w, r, col, sz, 0x6c7086);
-		}
-		if (i == fm->sel)
-			for (int c = 0; c < w->cols; c++)
-				w->gbg[r][c] = 0x313244;
-	}
 }
 
 /* Directories first, then alphabetical. */
@@ -376,10 +351,9 @@ void ctxmenu_open(int x, int y)
 		focused = i;
 
 		struct fmstate *fm = w->fm;
-		int content_top = w->y + TITLE_H + FM_TOOLH;
-		int row = (y - content_top) / font_h;
+		int row = fm_row_at(w, y);
 		int entidx = -1;
-		if (row >= 0 && row < w->rows) {
+		if (row >= 0) {
 			int vi = fm->scroll + row;
 			if (vi >= 0 && vi < fm->vcount)
 				entidx = fm->view[vi];
@@ -610,10 +584,9 @@ void fm_drop(int x, int y)
 			continue;
 
 		struct fmstate *tfm = tw->fm;
-		int content_top = tw->y + TITLE_H + FM_TOOLH;
-		int row = (y - content_top) / font_h;
-		if (row < 0 || row >= tw->rows)
-			return; /* dropped on the titlebar/toolbar: no-op */
+		int row = fm_row_at(tw, y);
+		if (row < 0)
+			return; /* dropped on the titlebar/toolbar/header: no-op */
 		int vi = tfm->scroll + row;
 		if (vi < 0 || vi >= tfm->vcount)
 			return; /* dropped past the end of the listing: no-op */
@@ -691,8 +664,8 @@ void fm_click(struct window *w, int x, int y)
 	fm->status[0] = 0;
 	fm->confirm_del = 0;
 
-	int row = (y - (w->y + TITLE_H + FM_TOOLH)) / font_h;
-	if (row < 0 || row >= w->rows)
+	int row = fm_row_at(w, y);
+	if (row < 0)
 		return;
 	int vi = fm->scroll + row;
 	if (vi < 0 || vi >= fm->vcount)
@@ -799,8 +772,8 @@ int fm_keys(struct window *w, const char *buf, int n)
 				switch (buf[i + 2]) {
 				case 'A': delta = -1; break;
 				case 'B': delta = 1; break;
-				case '5': delta = -(w->rows - 1); break;
-				case '6': delta = w->rows - 1; break;
+				case '5': delta = -(fm_visible_rows(w) - 1); break;
+				case '6': delta = fm_visible_rows(w) - 1; break;
 				default: break;
 				}
 				fm->confirm_del = 0;
@@ -837,6 +810,186 @@ int fm_keys(struct window *w, const char *buf, int n)
 		}
 	}
 	return changed;
+}
+
+/* ---- listing renderer ---------------------------------------------- */
+
+static void human_size(long b, char *out, size_t n)
+{
+	if (b < 1024)
+		snprintf(out, n, "%ld B", b);
+	else if (b < 1024L * 1024)
+		snprintf(out, n, "%.1f K", b / 1024.0);
+	else if (b < 1024L * 1024 * 1024)
+		snprintf(out, n, "%.1f M", b / (1024.0 * 1024));
+	else
+		snprintf(out, n, "%.1f G", b / (1024.0 * 1024 * 1024));
+}
+
+/* A ~16px file-type icon, composed from the exported primitives; `bg` is the
+ * row colour, used to punch cutouts back out of the ink. */
+static void fm_icon(enum fcat cat, int cx, int cy, uint32_t col, uint32_t bg)
+{
+	switch (cat) {
+	case FCAT_DIR:
+		fill_round_rect(cx - 8, cy - 7, 7, 5, 2, col);       /* tab */
+		fill_round_rect(cx - 8, cy - 4, 16, 10, 2, col);     /* body */
+		break;
+	case FCAT_IMAGE:
+		fill_round_rect(cx - 8, cy - 6, 16, 12, 2, col);
+		fill_round_rect(cx - 6, cy - 4, 12, 8, 1, bg);
+		fill_circle(cx + 3, cy - 1, 2, col);
+		fill_rect(cx - 6, cy + 2, 12, 2, col);
+		break;
+	case FCAT_ARCHIVE:
+		fill_round_rect(cx - 7, cy - 7, 14, 14, 2, col);
+		fill_rect(cx - 7, cy - 1, 14, 3, bg);
+		fill_round_rect(cx - 2, cy - 5, 4, 3, 1, bg);
+		break;
+	case FCAT_CODE:
+		fill_round_rect(cx - 7, cy - 8, 14, 16, 2, col);
+		fill_rect(cx - 4, cy - 1, 2, 2, bg);
+		fill_rect(cx - 5, cy + 1, 2, 2, bg);
+		fill_rect(cx - 4, cy + 3, 2, 2, bg);
+		fill_rect(cx + 2, cy - 1, 2, 2, bg);
+		fill_rect(cx + 3, cy + 1, 2, 2, bg);
+		fill_rect(cx + 2, cy + 3, 2, 2, bg);
+		break;
+	case FCAT_EXEC:
+		fill_round_rect(cx - 8, cy - 7, 16, 14, 4, col);
+		fill_round_rect(cx - 3, cy - 3, 6, 6, 1, mix(col, bg, 150));
+		break;
+	default: /* TEXT, OTHER: a page with a couple of text lines */
+		fill_round_rect(cx - 6, cy - 8, 12, 16, 2, col);
+		fill_rect(cx - 3, cy - 3, 6, 1, bg);
+		fill_rect(cx - 3, cy,     6, 1, bg);
+		fill_rect(cx - 3, cy + 3, 5, 1, bg);
+		break;
+	}
+}
+
+void draw_files(struct window *w, int content_y, int content_h)
+{
+	struct fmstate *fm = w->fm;
+	uint32_t accent = win_accent(w);
+	int lx = w->x, lw = w->w, pad = 10;
+
+	/* ---- toolbar ---- */
+	fill_rect(lx, content_y, lw, FM_TOOLH, 0x181826);
+	for (int b = 0; b < FM_NBTN; b++) {
+		int bx = lx + 6 + b * (FM_BTNW + 4);
+		int armed = (b == 2 && fm->confirm_del);
+		fill_round_rect_grad(bx, content_y + 3, FM_BTNW, FM_TOOLH - 6, 4,
+				     armed ? 0xf38ba8 : 0x2b2b3a,
+				     armed ? 0xc4506a : 0x22222e);
+		int blw = (int)strlen(fm_btns[b]) * font_w;
+		draw_text_clip(bx + (FM_BTNW - blw) / 2,
+			       content_y + (FM_TOOLH - font_h) / 2,
+			       fm_btns[b], 0xdfe4f2, FM_BTNW - 6);
+	}
+	int tx = lx + 6 + FM_NBTN * (FM_BTNW + 4) + 6;
+	int ty2 = content_y + (FM_TOOLH - font_h) / 2;
+	if (fm->prompt) {
+		static const char *plabel[] = { "", "file", "dir", "rename" };
+		char line[FM_NAMELEN + 16];
+		snprintf(line, sizeof(line), "%s: %s_", plabel[fm->prompt], fm->pbuf);
+		draw_text_clip(tx, ty2, line, 0xf9e2af, lx + lw - tx - 6);
+	} else if (fm->searching) {
+		char line[FM_NAMELEN + 16];
+		snprintf(line, sizeof(line), "search: %s_", fm->search);
+		draw_text_clip(tx, ty2, line, 0x94e2d5, lx + lw - tx - 6);
+	} else if (fm->status[0]) {
+		draw_text_clip(tx, ty2, fm->status, 0x9399b2, lx + lw - tx - 6);
+	} else if (fm->search[0]) {
+		char line[FM_NAMELEN + 16];
+		snprintf(line, sizeof(line), "filter: %s", fm->search);
+		draw_text_clip(tx, ty2, line, 0x6c7086, lx + lw - tx - 6);
+	}
+
+	/* ---- column layout ---- */
+	int type_w = 6 * font_w, size_w = 9 * font_w;
+	int name_x = lx + pad + 22;
+	int size_x = lx + lw - pad - type_w - size_w;
+	int type_x = lx + lw - pad - type_w;
+
+	/* ---- column header ---- */
+	int hy = content_y + FM_TOOLH;
+	fill_rect(lx, hy, lw, FM_HEADH, 0x1a1a28);
+	fill_rect(lx, hy + FM_HEADH - 1, lw, 1, 0x2a2a40);
+	int hty = hy + (FM_HEADH - font_h) / 2;
+	draw_text(name_x, hty, "Name", 0x6c7086);
+	draw_text(size_x, hty, "Size", 0x6c7086);
+	draw_text(type_x, hty, "Type", 0x6c7086);
+
+	/* ---- rows ---- */
+	int list_top = content_y + FM_TOOLH + FM_HEADH;
+	int list_bot = content_y + content_h;
+	fill_rect(lx, list_top, lw, list_bot - list_top, COL_BG_DEFAULT);
+
+	int vis = fm_visible_rows(w), rowh = fm_rowh();
+	if (fm->vcount == 0) {
+		const char *msg = "empty folder";
+		draw_text(lx + (lw - (int)strlen(msg) * font_w) / 2,
+			  list_top + rowh, msg, 0x6c7086);
+	}
+	for (int r = 0; r < vis; r++) {
+		int vi = fm->scroll + r;
+		if (vi >= fm->vcount)
+			break;
+		int i = fm->view[vi];
+		struct fent *e = &fm->ents[i];
+		int ry = list_top + r * rowh;
+		int sel = (i == fm->sel);
+
+		uint32_t rowbg = COL_BG_DEFAULT;
+		if (sel) {
+			rowbg = mix(accent, COL_BG_DEFAULT, 150);
+			fill_round_rect(lx + 4, ry + 1, lw - 8, rowh - 2, 4, rowbg);
+		} else if (r & 1) {
+			rowbg = 0x20202f;
+			fill_rect(lx + 4, ry + 1, lw - 8, rowh - 2, rowbg);
+		}
+
+		enum fcat cat = classify_file(e->name, e->isdir, e->isexec);
+		int hidden = (e->name[0] == '.');
+		uint32_t col = hidden ? 0x6c7086
+			: (cat == FCAT_TEXT || cat == FCAT_OTHER) ? COL_FG_DEFAULT
+			: fcat_color(cat);
+		uint32_t iconc = hidden ? 0x585b70 : fcat_color(cat);
+
+		fm_icon(cat, lx + pad + 8, ry + rowh / 2, iconc, rowbg);
+
+		int ty = ry + (rowh - font_h) / 2;
+		draw_text_clip(name_x, ty, e->name, sel ? 0xffffff : col,
+			       size_x - name_x - 8);
+		if (e->isreg) {
+			char sz[24];
+			human_size(e->size, sz, sizeof(sz));
+			draw_text(size_x, ty, sz, 0x6c7086);
+		} else if (e->isdir) {
+			draw_text(size_x, ty, "--", 0x585b70);
+		}
+		draw_text_clip(type_x, ty, fcat_tag(cat), 0x6c7086, type_w);
+	}
+
+	/* ---- scroll position indicator (non-interactive) ---- */
+	if (fm->vcount > vis && vis > 0) {
+		int track_h = list_bot - list_top - 4;
+		int th = track_h * vis / fm->vcount;
+		if (th < 12) th = 12;
+		int maxsc = fm->vcount - vis;
+		int sy = list_top + 2 + (maxsc > 0 ? (track_h - th) * fm->scroll / maxsc : 0);
+		fill_round_rect(lx + lw - 5, sy, 3, th, 1, 0x45475a);
+	}
+
+	/* resize grip */
+	if (!w->maximized)
+		for (int k = 0; k < 3; k++) {
+			int gx = w->x + w->w - 5 - k * 4;
+			int gy = w->y + w->h - 5;
+			for (int m = 0; m <= k; m++)
+				fill_rect(gx, gy - m * 4, 2, 2, 0x6c7086);
+		}
 }
 
 int spawn_file_window(void)

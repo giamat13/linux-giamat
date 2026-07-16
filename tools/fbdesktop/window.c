@@ -138,42 +138,10 @@ void draw_window(struct window *w)
 		return; /* no grid, no resize grip -- settings is a fixed panel */
 	}
 
-	/* file-manager toolbar sits between titlebar and listing */
+	/* file manager draws its own toolbar + icon listing (no grid) */
 	if (w->type == WIN_FILES && w->fm) {
-		struct fmstate *fm = w->fm;
-		fill_rect(w->x, content_y, w->w, FM_TOOLH, 0x181826);
-		for (int b = 0; b < FM_NBTN; b++) {
-			int bx = w->x + 6 + b * (FM_BTNW + 4);
-			int armed = (b == 2 && fm->confirm_del);
-			fill_round_rect_grad(bx, content_y + 3, FM_BTNW, FM_TOOLH - 6, 4,
-					     armed ? 0xf38ba8 : 0x2b2b3a,
-					     armed ? 0xc4506a : 0x22222e);
-			int lw = (int)strlen(fm_btns[b]) * font_w;
-			draw_text_clip(bx + (FM_BTNW - lw) / 2,
-				       content_y + (FM_TOOLH - font_h) / 2,
-				       fm_btns[b], 0xdfe4f2, FM_BTNW - 6);
-		}
-		/* name prompt / search / status share the strip right of the buttons */
-		int tx = w->x + 6 + FM_NBTN * (FM_BTNW + 4) + 6;
-		int ty2 = content_y + (FM_TOOLH - font_h) / 2;
-		if (fm->prompt) {
-			static const char *plabel[] = { "", "file", "dir", "rename" };
-			char line[FM_NAMELEN + 16];
-			snprintf(line, sizeof(line), "%s: %s_", plabel[fm->prompt], fm->pbuf);
-			draw_text_clip(tx, ty2, line, 0xf9e2af, w->x + w->w - tx - 6);
-		} else if (fm->searching) {
-			char line[FM_NAMELEN + 16];
-			snprintf(line, sizeof(line), "search: %s_", fm->search);
-			draw_text_clip(tx, ty2, line, 0x94e2d5, w->x + w->w - tx - 6);
-		} else if (fm->status[0]) {
-			draw_text_clip(tx, ty2, fm->status, 0x9399b2, w->x + w->w - tx - 6);
-		} else if (fm->search[0]) {
-			char line[FM_NAMELEN + 16];
-			snprintf(line, sizeof(line), "filter: %s", fm->search);
-			draw_text_clip(tx, ty2, line, 0x6c7086, w->x + w->w - tx - 6);
-		}
-		content_y += FM_TOOLH;
-		content_h -= FM_TOOLH;
+		draw_files(w, content_y, content_h);
+		return;
 	}
 
 	/* task manager draws its own sidebar + panels (no grid) */
