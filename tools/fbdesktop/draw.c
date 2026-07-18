@@ -20,6 +20,24 @@ void put_pixel(int x, int y, uint32_t color)
 	}
 }
 
+uint32_t get_pixel(int x, int y)
+{
+	if (x < 0 || y < 0 || x >= xres || y >= yres)
+		return 0;
+	uint8_t *buf = backbuf ? backbuf : fbp;
+	long off = (long)y * line_length + (long)x * (bpp / 8);
+	if (bpp == 32) {
+		return *(uint32_t *)(buf + off) & 0xffffff;
+	} else if (bpp == 16) {
+		uint16_t v = *(uint16_t *)(buf + off);
+		uint32_t r = ((v >> 11) & 0x1f) << 3, g = ((v >> 5) & 0x3f) << 2, b = (v & 0x1f) << 3;
+		return (r << 16) | (g << 8) | b;
+	} else if (bpp == 24) {
+		return ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 1] << 8) | buf[off];
+	}
+	return 0;
+}
+
 void fill_rect(int x, int y, int w, int h, uint32_t color)
 {
 	for (int j = 0; j < h; j++)
@@ -300,6 +318,31 @@ void draw_glyph(int g, int cx, int cy, uint32_t fg, uint32_t hole)
 		for (int r = 0; r < 2; r++)
 			for (int c = 0; c < 4; c++)
 				fill_rect(cx - 13 + c * 7, cy - 2 + r * 8, 4, 4, hole);
+		break;
+	case G_TIMER:
+		/* stopwatch: a ring, a top button, and two hands off-center */
+		fill_round_rect(cx - 4, cy - 21, 8, 5, 1, fg);
+		fill_ring(cx, cy + 1, 18, 5, fg);
+		fill_rect(cx - 2, cy - 9, 4, 11, fg);
+		fill_rect(cx, cy, 9, 4, fg);
+		break;
+	case G_SEARCH:
+		/* magnifying glass: a ring plus an angled handle */
+		fill_ring(cx - 3, cy - 3, 14, 5, fg);
+		fill_round_rect(cx + 5, cy + 5, 6, 15, 3, fg);
+		break;
+	case G_DISK:
+		/* a pie slice inside a ring -- reads as "usage" */
+		fill_ring(cx, cy, 19, 5, fg);
+		fill_triangle(cx, cy, 14, 0, fg);
+		fill_rect(cx, cy - 14, 3, 14, fg);
+		break;
+	case G_SNAP:
+		/* a camera: body, lens ring, viewfinder bump */
+		fill_round_rect(cx - 20, cy - 12, 40, 26, 4, fg);
+		fill_round_rect(cx - 7, cy - 20, 14, 8, 2, fg);
+		fill_ring(cx, cy + 1, 10, 4, hole);
+		fill_circle(cx, cy + 1, 5, fg);
 		break;
 	default:
 		break;

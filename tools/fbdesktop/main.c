@@ -86,6 +86,18 @@ static void do_hit_test(int x, int y)
 					paint_click(w, x, y);
 				} else if (w->type == WIN_CAL) {
 					cal_click(w, x, y);
+				} else if (w->type == WIN_TIMER) {
+					timer_click(w, x, y);
+				} else if (w->type == WIN_SEARCH) {
+					search_click(w, x, y);
+				} else if (w->type == WIN_DISKUSAGE) {
+					du_click(w, x, y);
+				} else if (w->type == WIN_IMGVIEW) {
+					imgview_click(w, x, y);
+				} else if (w->type == WIN_ARCHIVE) {
+					archive_click(w, x, y);
+				} else if (w->type == WIN_SHOT) {
+					shot_click(w, x, y);
 				}
 				return;
 			}
@@ -136,6 +148,18 @@ static void launch_icon(int idx)
 		spawn_paint();
 	} else if (ic->action == 10) {
 		spawn_cal();
+	} else if (ic->action == 11) {
+		spawn_timer();
+	} else if (ic->action == 12) {
+		spawn_search();
+	} else if (ic->action == 13) {
+		spawn_diskusage();
+	} else if (ic->action == 14) {
+		spawn_imgview(NULL);
+	} else if (ic->action == 15) {
+		spawn_archive(NULL);
+	} else if (ic->action == 16) {
+		spawn_shot();
 	}
 }
 
@@ -595,6 +619,9 @@ int main(void)
 					need_redraw = 1;
 				else if (wins[focused].type == WIN_CAL &&
 					 cal_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+				else if (wins[focused].type == WIN_SEARCH &&
+					 search_keys(&wins[focused], buf, r))
 					need_redraw = 1;
 			}
 		}

@@ -553,7 +553,15 @@ void fm_open_selected(int winidx, int entidx)
 		fm_load(w);
 	} else if (e->isreg) {
 		/* Regular files only: opening a fifo or char device would block forever. */
-		spawn_editor(path);
+		enum fcat cat = classify_file(e->name, 0, e->isexec);
+		const char *dot = strrchr(e->name, '.');
+		if (cat == FCAT_IMAGE && dot && (!strcasecmp(dot, ".ppm") || !strcasecmp(dot, ".bmp")))
+			spawn_imgview(path);
+		else if (cat == FCAT_ARCHIVE && dot &&
+			 (!strcasecmp(dot, ".tar") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tgz")))
+			spawn_archive(path);
+		else
+			spawn_editor(path);
 	}
 }
 

@@ -29,7 +29,8 @@ CFLAGS := -O2 -flto -Wall -Iinclude
 LDLIBS := -lX11 -lXext -lXtst
 
 SHELL_SRCS := main desktop window draw grid globals
-APP_SRCS   := terminal files editor taskmgr settings browser calc paint calendar
+APP_SRCS   := terminal files editor taskmgr settings browser calc paint calendar \
+	      timer search diskusage imgview archive screenshot
 
 OBJS := $(SHELL_SRCS:%=$(OBJDIR)/shell/%.o) $(APP_SRCS:%=$(OBJDIR)/apps/%.o)
 

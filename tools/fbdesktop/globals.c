@@ -12,6 +12,12 @@ struct icon icons[NUM_ICONS] = {
 	{"PAINT",     NULL, 0xec4899, 9, G_PAINT},
 	{"CALENDAR",  NULL, 0xf59e0b, 10, G_CAL},
 	{"SETTINGS",  NULL, 0x64748b, 6, G_GEAR},
+	{"TIMER",     NULL, 0xfbbf24, 11, G_TIMER},
+	{"SEARCH",    NULL, 0x38bdf8, 12, G_SEARCH},
+	{"DISK USAGE",NULL, 0x84cc16, 13, G_DISK},
+	{"IMAGES",    NULL, 0xf472b6, 14, G_IMAGE},
+	{"ARCHIVE",   NULL, 0xa78bfa, 15, G_ARCHIVE},
+	{"SNIPPING",  NULL, 0x34d399, 16, G_SNAP},
 	{"REBOOT",    NULL, 0xef4444, 1, G_REFRESH},
 	{"POWER OFF", NULL, 0xf43f5e, 2, G_POWER},
 };

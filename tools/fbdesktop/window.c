@@ -52,6 +52,31 @@ void close_window(int i)
 		free(wins[i].cal);
 		wins[i].cal = NULL;
 	}
+	if (wins[i].timer) {
+		free(wins[i].timer);
+		wins[i].timer = NULL;
+	}
+	if (wins[i].search) {
+		free(wins[i].search);
+		wins[i].search = NULL;
+	}
+	if (wins[i].du) {
+		free(wins[i].du);
+		wins[i].du = NULL;
+	}
+	if (wins[i].img) {
+		free(wins[i].img->rgb);
+		free(wins[i].img);
+		wins[i].img = NULL;
+	}
+	if (wins[i].arc) {
+		free(wins[i].arc);
+		wins[i].arc = NULL;
+	}
+	if (wins[i].shot) {
+		free(wins[i].shot);
+		wins[i].shot = NULL;
+	}
 	wins[i].used = 0;
 	for (int zi = 0; zi < zcount; zi++) {
 		if (zorder[zi] == i) {
@@ -183,6 +208,36 @@ void draw_window(struct window *w)
 
 	if (w->type == WIN_CAL && w->cal) {
 		draw_cal(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_TIMER && w->timer) {
+		draw_timer(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_SEARCH && w->search) {
+		draw_search(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_DISKUSAGE && w->du) {
+		draw_diskusage(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_IMGVIEW && w->img) {
+		draw_imgview(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_ARCHIVE && w->arc) {
+		draw_archive(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_SHOT && w->shot) {
+		draw_shot(w, content_y, content_h);
 		return;
 	}
 

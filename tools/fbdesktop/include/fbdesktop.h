@@ -74,11 +74,13 @@
 #define COL_BG_DEFAULT 0x1e1e2e
 
 enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS,
-	       WIN_BROWSER, WIN_CALC, WIN_PAINT, WIN_CAL };
+	       WIN_BROWSER, WIN_CALC, WIN_PAINT, WIN_CAL, WIN_TIMER, WIN_SEARCH,
+	       WIN_DISKUSAGE, WIN_IMGVIEW, WIN_ARCHIVE, WIN_SHOT };
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
-	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC, G_GLOBE, G_CALC, G_PAINT, G_CAL
+	G_IMAGE, G_ARCHIVE, G_CODE, G_EXEC, G_GLOBE, G_CALC, G_PAINT, G_CAL,
+	G_TIMER, G_SEARCH, G_DISK, G_SNAP
 };
 
 /* File-type classification by extension -- drives the icon/tag/color shown
@@ -93,11 +95,13 @@ struct icon {
 	const char *cmd;
 	uint32_t color;
 	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,
-		     * 6=settings,7=X app,8=calculator,9=paint,10=calendar */
+		     * 6=settings,7=X app,8=calculator,9=paint,10=calendar,11=timer,
+		     * 12=search,13=disk usage,14=image viewer,15=archive manager,
+		     * 16=screenshot */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
-#define NUM_ICONS 10
+#define NUM_ICONS 16
 
 /* Desktop themes -- the only setting that has any effect at runtime; the
  * framebuffer mode itself is fixed by GRUB's gfxpayload at boot. */
@@ -276,6 +280,81 @@ struct calstate {
 	char status[48];
 };
 
+/* Timer state, allocated only for WIN_TIMER windows. Stopwatch and countdown
+ * share one struct: "running" plus a monotonic start mark and a banked total,
+ * so pause/resume never drifts (no per-tick accumulation error). */
+struct timerstate {
+	int running;
+	int mode;              /* 0 stopwatch, 1 countdown */
+	struct timespec started;
+	double banked;         /* seconds accumulated before the current run */
+	double countdown_secs; /* configured duration, countdown mode only */
+	char status[48];
+};
+
+/* File Search state, allocated only for WIN_SEARCH windows. A plain recursive
+ * substring search under one root, capped at SEARCH_MAXRES hits. */
+#define SEARCH_MAXRES 256
+struct searchresult {
+	char path[FM_FULLLEN];
+	int isdir;
+};
+struct searchstate {
+	char root[FM_PATHLEN];
+	char pattern[FM_NAMELEN];
+	int typing;    /* Ctrl+F-style capture into pattern[] */
+	struct searchresult res[SEARCH_MAXRES];
+	int nres, scroll;
+	char status[64];
+};
+
+/* Disk Usage state, allocated only for WIN_DISKUSAGE windows. One row per
+ * immediate child of `path`, sized by a full recursive walk (like `du
+ * --max-depth=1`); drilling into a row re-walks the new path. */
+#define DU_MAXENT 256
+struct duent {
+	char name[FM_NAMELEN];
+	long long size;
+	int isdir;
+};
+struct dustate {
+	char path[FM_PATHLEN];
+	struct duent ents[DU_MAXENT];
+	int count, scroll;
+	long long total;
+	char status[64];
+};
+
+/* Image Viewer state, allocated only for WIN_IMGVIEW windows. Only the two
+ * formats this desktop itself produces -- PPM (paint.c's save format) and
+ * plain 24-bit BMP -- decode with no library at all. */
+struct imgstate {
+	char path[FM_FULLLEN];
+	unsigned char *rgb; /* iw*ih*3, top-to-bottom, malloc'd */
+	int iw, ih;
+	char status[64];
+};
+
+/* Archive Manager state, allocated only for WIN_ARCHIVE windows. Lists and
+ * extracts via the system `tar`, already present for any Debian base --
+ * gzip/xz/bzip2 members included, no new package required. */
+#define ARC_MAXENT 512
+#define ARC_NAMELEN 200
+struct archivestate {
+	char path[FM_FULLLEN];
+	char ent[ARC_MAXENT][ARC_NAMELEN];
+	int count, scroll;
+	char status[96];
+};
+
+/* Screenshot Tool state, allocated only for WIN_SHOT windows. No captured
+ * buffer is kept: the preview reads straight from the live backbuf, so all
+ * that needs remembering is the last saved filename. */
+struct shotstate {
+	int count;
+	char status[64];
+};
+
 struct window {
 	int used;
 	enum wintype type;
@@ -291,6 +370,12 @@ struct window {
 	struct calcstate *calc;   /* WIN_CALC only */
 	struct paintstate *paint; /* WIN_PAINT only */
 	struct calstate *cal;     /* WIN_CAL only */
+	struct timerstate *timer;     /* WIN_TIMER only */
+	struct searchstate *search;   /* WIN_SEARCH only */
+	struct dustate *du;           /* WIN_DISKUSAGE only */
+	struct imgstate *img;         /* WIN_IMGVIEW only */
+	struct archivestate *arc;     /* WIN_ARCHIVE only */
+	struct shotstate *shot;       /* WIN_SHOT only */
 	int tab;                  /* WIN_TASKMGR: active tab */
 
 	int cols, rows;
@@ -392,6 +477,7 @@ void fill_round_rect_grad(int x, int y, int w, int h, int r,
 			  uint32_t top, uint32_t bot);
 void fill_vgradient(int x, int y, int w, int h, uint32_t top, uint32_t bot);
 uint32_t mix(uint32_t a, uint32_t b, int t);
+uint32_t get_pixel(int x, int y);
 void put_pixel(int x, int y, uint32_t color);
 
 /* desktop.c */
@@ -490,6 +576,37 @@ void cal_click(struct window *w, int px, int py);
 int cal_keys(struct window *w, const char *buf, int n);
 void draw_cal(struct window *w, int content_y, int content_h);
 int spawn_cal(void);
+
+/* timer.c */
+void draw_timer(struct window *w, int content_y, int content_h);
+void timer_click(struct window *w, int px, int py);
+int spawn_timer(void);
+
+/* search.c */
+void draw_search(struct window *w, int content_y, int content_h);
+void search_click(struct window *w, int px, int py);
+int search_keys(struct window *w, const char *buf, int n);
+int spawn_search(void);
+
+/* diskusage.c */
+void draw_diskusage(struct window *w, int content_y, int content_h);
+void du_click(struct window *w, int px, int py);
+int spawn_diskusage(void);
+
+/* imgview.c */
+void draw_imgview(struct window *w, int content_y, int content_h);
+void imgview_click(struct window *w, int px, int py);
+int spawn_imgview(const char *path);
+
+/* archive.c */
+void draw_archive(struct window *w, int content_y, int content_h);
+void archive_click(struct window *w, int px, int py);
+int spawn_archive(const char *path);
+
+/* screenshot.c */
+void draw_shot(struct window *w, int content_y, int content_h);
+void shot_click(struct window *w, int px, int py);
+int spawn_shot(void);
 
 /* main.c */
 int process_pointer(int nx, int ny, int left, int right);
