@@ -9,6 +9,11 @@
 #   GDK_BACKEND=x11        QEMU's window is GTK. Under WSLg, GTK otherwise picks
 #   -display gtk,gl=off    Wayland and the window opens, takes focus, and never
 #                          paints a pixel.
+#   -device usb-mouse      usb-tablet alone has no wheel dimension at all --
+#                          added purely so there's a wheel to test against;
+#                          fbdesktop still takes cursor position from the
+#                          tablet (drift-free) and only reads wheel ticks off
+#                          this device, so it can't reintroduce relative drift.
 #
 # And the reason this is a script rather than one long command line: WSLg's
 # XWayland reports a 640x480 screen, while our window is ~1280x825. WSLg then
@@ -30,7 +35,7 @@ qemu-system-x86_64 \
 	-accel kvm -cpu host -m 3G -smp 4 \
 	-cdrom "$ISO" \
 	-vga std -display gtk,gl=off \
-	-usb -device usb-tablet \
+	-usb -device usb-tablet -device usb-mouse \
 	-netdev user,id=n0 -device e1000,netdev=n0 \
 	-serial mon:stdio &
 qemu_pid=$!

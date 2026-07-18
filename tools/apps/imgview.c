@@ -40,7 +40,7 @@ static int read_ppm_int(FILE *f, int *out)
 	return 0;
 }
 
-static int load_ppm(const char *path, unsigned char **out_rgb, int *ow, int *oh)
+int load_ppm(const char *path, unsigned char **out_rgb, int *ow, int *oh)
 {
 	FILE *f = fopen(path, "rb");
 	if (!f)

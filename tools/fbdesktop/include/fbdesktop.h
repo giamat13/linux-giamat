@@ -631,6 +631,10 @@ void archive_click(struct window *w, int px, int py);
 void archive_scroll(struct window *w, int value);
 int spawn_archive(const char *path);
 int archive_create(const char *srcpath);
+/* fork+execvp a command with no shell involved, wait for it, return 0 on a
+ * clean exit. Shared with pdfview.c (pdftoppm/pdfinfo) so the tricky
+ * SIGCHLD-around-waitpid dance (see run_argv_wait's own comment) exists once. */
+int run_argv_wait(char *const argv[]);
 
 /* screenshot.c */
 void draw_shot(struct window *w, int content_y, int content_h);

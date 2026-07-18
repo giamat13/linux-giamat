@@ -55,7 +55,7 @@ static int run_capture(char *const argv[], char *outbuf, size_t outsz)
 	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 }
 
-static int run_wait(char *const argv[])
+int run_argv_wait(char *const argv[])
 {
 	signal(SIGCHLD, SIG_DFL);
 	pid_t pid = fork();
@@ -116,7 +116,7 @@ static void archive_extract(struct archivestate *a)
 		return;
 	}
 	char *argv[] = { "tar", "xf", a->path, "-C", dest, NULL };
-	if (run_wait(argv) == 0)
+	if (run_argv_wait(argv) == 0)
 		snprintf(a->status, sizeof(a->status), "extracted to %s", dest);
 	else
 		snprintf(a->status, sizeof(a->status), "extract failed");
@@ -139,7 +139,7 @@ int archive_create(const char *srcpath)
 	char dest[FM_FULLLEN];
 	snprintf(dest, sizeof(dest), "%s/%s.tar.gz", parent, base);
 	char *argv[] = { "tar", "czf", dest, "-C", parent, base, NULL };
-	return run_wait(argv);
+	return run_argv_wait(argv);
 }
 
 /* ---- input -------------------------------------------------------------- */
