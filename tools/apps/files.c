@@ -449,6 +449,19 @@ int ctxmenu_click(int x, int y)
 				snprintf(fm->status, sizeof(fm->status), "select something to delete");
 			}
 			break;
+		case 5: /* Compress */
+			if (has_target) {
+				char path[FM_FULLLEN];
+				fm_path(fm, e->name, path, sizeof(path));
+				if (archive_create(path) == 0)
+					snprintf(fm->status, sizeof(fm->status), "compressed %s.tar.gz", e->name);
+				else
+					snprintf(fm->status, sizeof(fm->status), "compress failed");
+				fm_load(w);
+			} else {
+				snprintf(fm->status, sizeof(fm->status), "select something to compress");
+			}
+			break;
 		}
 		fm_render(w);
 	} else { /* CTXMODE_DESKTOP */
@@ -480,6 +493,14 @@ int ctxmenu_click(int x, int y)
 				char path[FM_FULLLEN];
 				snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, df->name);
 				if (df->isdir) rmdir(path); else unlink(path);
+				desk_scan();
+			}
+			break;
+		case 5: /* Compress */
+			if (df) {
+				char path[FM_FULLLEN];
+				snprintf(path, sizeof(path), "%s/%s", DESKTOP_DIR, df->name);
+				archive_create(path);
 				desk_scan();
 			}
 			break;

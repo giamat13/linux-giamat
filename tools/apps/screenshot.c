@@ -9,7 +9,7 @@
 #define SH_TXT  0xcdd6f4
 #define SH_DIM  0x6c7086
 #define SH_TOOLH 36
-#define SH_DIR DESKTOP_DIR "/Screenshots"
+#define SH_DIR "/root/Screenshots"
 
 static void wr_le16(unsigned char *p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
 static void wr_le32(unsigned char *p, uint32_t v)

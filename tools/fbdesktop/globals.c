@@ -37,7 +37,7 @@ const struct tmtab tm_tabs[TM_NTABS] = {
 	{"System",      NULL},
 };
 
-const char *ctx_items[CTX_NITEMS] = { "Copy", "Cut", "Paste", "Rename", "Delete" };
+const char *ctx_items[CTX_NITEMS] = { "Copy", "Cut", "Paste", "Rename", "Delete", "Compress" };
 const char *fm_btns[FM_NBTN] = { "New File", "New Dir", "Delete", "Refresh" };
 
 int theme_idx;

@@ -122,6 +122,26 @@ static void archive_extract(struct archivestate *a)
 		snprintf(a->status, sizeof(a->status), "extract failed");
 }
 
+/* Compress a file or directory into "<name>.tar.gz" next to it. Runs with
+ * -C into the parent dir so members are stored relative (plain "name", not
+ * "/root/Desktop/name") -- the same reason the command-line `tar` recipe
+ * always does this. */
+int archive_create(const char *srcpath)
+{
+	char parent[FM_FULLLEN], base[FM_NAMELEN];
+	snprintf(parent, sizeof(parent), "%s", srcpath);
+	char *slash = strrchr(parent, '/');
+	if (!slash || slash == parent)
+		return -1;
+	snprintf(base, sizeof(base), "%s", slash + 1);
+	*slash = 0;
+
+	char dest[FM_FULLLEN];
+	snprintf(dest, sizeof(dest), "%s/%s.tar.gz", parent, base);
+	char *argv[] = { "tar", "czf", dest, "-C", parent, base, NULL };
+	return run_wait(argv);
+}
+
 /* ---- input -------------------------------------------------------------- */
 
 void archive_click(struct window *w, int px, int py)

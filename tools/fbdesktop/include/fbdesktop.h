@@ -134,7 +134,7 @@ struct tmtab {
 enum { CTXMODE_NONE, CTXMODE_FILEWIN, CTXMODE_DESKTOP };
 #define CTX_W 130
 #define CTX_ITEMH 24
-#define CTX_NITEMS 5
+#define CTX_NITEMS 6
 
 /* The desktop is backed by a real directory, same as Windows: files there are
  * drawn as desktop icons after the fixed app icons, and dropping a file
@@ -615,6 +615,7 @@ int spawn_imgview(const char *path);
 void draw_archive(struct window *w, int content_y, int content_h);
 void archive_click(struct window *w, int px, int py);
 int spawn_archive(const char *path);
+int archive_create(const char *srcpath);
 
 /* screenshot.c */
 void draw_shot(struct window *w, int content_y, int content_h);
