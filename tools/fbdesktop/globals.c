@@ -77,6 +77,7 @@ int alt_held;
 int sd_active;
 int sd_saved[MAX_WIN];
 int start_menu_open;
+char start_filter[32];
 
 uint8_t *fbp;
 uint8_t *backbuf;

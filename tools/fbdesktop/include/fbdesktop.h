@@ -447,6 +447,7 @@ extern int alt_held;
 extern int sd_active;      /* "show desktop" is on: everything was minimized */
 extern int sd_saved[MAX_WIN];
 extern int start_menu_open;
+extern char start_filter[32]; /* Start Menu's search-as-you-type app filter */
 
 extern uint8_t *fbp;      /* real framebuffer */
 extern uint8_t *backbuf;  /* offscreen: draw here, then flush in one memcpy */
@@ -503,6 +504,7 @@ void toggle_show_desktop(void);
 int start_x(void);
 int start_hit(int px, int py);
 int start_menu_row_at(int px, int py);
+int start_menu_keys(const char *buf, int n);
 void draw_start_menu(void);
 
 /* term.c */

@@ -204,8 +204,38 @@ void desk_scan(void)
  * a desktop double-click uses, so opening from the menu behaves identically. */
 int start_x(void) { return 6; }
 
-static int start_menu_h(void) { return NUM_ICONS * SM_ROWH + 8; }
+#define SM_SEARCHH 28
+
+/* Fixed height sized for every icon, regardless of how many the filter
+ * currently matches -- so the popup doesn't resize (and jump position) as
+ * you type. */
+static int start_menu_h(void) { return SM_SEARCHH + NUM_ICONS * SM_ROWH + 8; }
 static int start_menu_y(void) { return yres - TASK_H - start_menu_h() - 6; }
+
+static int start_ci_contains(const char *hay, const char *needle)
+{
+	size_t nl = strlen(needle);
+	if (!nl)
+		return 1;
+	for (const char *p = hay; *p; p++) {
+		size_t i = 0;
+		while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+			i++;
+		if (i == nl)
+			return 1;
+	}
+	return 0;
+}
+
+/* Icons whose label matches start_filter, in menu order. Returns the count. */
+static int start_filtered(int *out)
+{
+	int n = 0;
+	for (int i = 0; i < NUM_ICONS; i++)
+		if (start_ci_contains(icons[i].label, start_filter))
+			out[n++] = i;
+	return n;
+}
 
 int start_hit(int px, int py)
 {
@@ -220,8 +250,40 @@ int start_menu_row_at(int px, int py)
 	int mx0 = start_x(), my0 = start_menu_y();
 	if (px < mx0 || px >= mx0 + SM_W || py < my0 || py >= my0 + start_menu_h())
 		return -1;
-	int row = (py - my0 - 4) / SM_ROWH;
-	return (row >= 0 && row < NUM_ICONS) ? row : -1;
+	if (py < my0 + SM_SEARCHH)
+		return -1; /* clicked the search box: no row, menu stays open via caller */
+	int idxs[NUM_ICONS];
+	int n = start_filtered(idxs);
+	int row = (py - (my0 + SM_SEARCHH) - 4) / SM_ROWH;
+	return (row >= 0 && row < n) ? idxs[row] : -1;
+}
+
+/* Typing while the menu is open filters it live, no click into a field
+ * needed -- Enter launches the top match, Escape closes with no action. */
+int start_menu_keys(const char *buf, int n)
+{
+	if (!start_menu_open)
+		return 0;
+	for (int i = 0; i < n; i++) {
+		unsigned char ch = (unsigned char)buf[i];
+		int len = (int)strlen(start_filter);
+		if (ch == 0x1b) {
+			start_menu_open = 0;
+		} else if (ch == '\r' || ch == '\n') {
+			int idxs[NUM_ICONS];
+			int cnt = start_filtered(idxs);
+			start_menu_open = 0;
+			if (cnt > 0)
+				launch_icon(idxs[0]);
+		} else if (ch == 0x7f || ch == 0x08) {
+			if (len > 0)
+				start_filter[len - 1] = 0;
+		} else if (ch >= 0x20 && ch < 0x7f && len < (int)sizeof(start_filter) - 1) {
+			start_filter[len] = (char)ch;
+			start_filter[len + 1] = 0;
+		}
+	}
+	return 1;
 }
 
 void draw_start_menu(void)
@@ -231,12 +293,24 @@ void draw_start_menu(void)
 	int mx0 = start_x(), my0 = start_menu_y(), mh = start_menu_h();
 	fill_round_rect(mx0 + 3, my0 + 4, SM_W, mh, 6, 0x0a0a11);
 	fill_round_rect(mx0, my0, SM_W, mh, 6, 0x2e2e3c);
-	for (int i = 0; i < NUM_ICONS; i++) {
-		int ry = my0 + 4 + i * SM_ROWH;
+
+	fill_round_rect(mx0 + 6, my0 + 4, SM_W - 12, SM_SEARCHH - 6, 5, 0x181826);
+	const char *shown = start_filter[0] ? start_filter : "Search apps...";
+	draw_text_clip(mx0 + 12, my0 + 4 + (SM_SEARCHH - 6 - font_h) / 2, shown,
+		       start_filter[0] ? 0xcdd6f4 : 0x6c7086, SM_W - 24);
+
+	int idxs[NUM_ICONS];
+	int n = start_filtered(idxs);
+	int top = my0 + SM_SEARCHH + 4;
+	for (int r = 0; r < n; r++) {
+		int i = idxs[r];
+		int ry = top + r * SM_ROWH;
 		fill_circle(mx0 + 16, ry + SM_ROWH / 2, 6, icons[i].color);
 		draw_text_clip(mx0 + 30, ry + (SM_ROWH - font_h) / 2, icons[i].label,
 			       0xdfe4f2, SM_W - 38);
 	}
+	if (n == 0)
+		draw_text(mx0 + 12, top + 4, "no match", 0x6c7086);
 }
 
 /* "Show desktop": minimize everything, click again to bring it all back.

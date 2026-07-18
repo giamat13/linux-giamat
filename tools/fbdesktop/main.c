@@ -14,6 +14,7 @@ static void do_hit_test(int x, int y)
 	if (y >= yres - TASK_H) {
 		if (start_hit(x, y)) {
 			start_menu_open = 1;
+			start_filter[0] = 0;
 			return;
 		}
 		if (x >= sd_x() && x < sd_x() + SD_W) {
@@ -609,9 +610,13 @@ int main(void)
 		if (fds[kbd_i].revents & POLLIN) {
 			char buf[64];
 			int r = read(STDIN_FILENO, buf, sizeof(buf));
+			if (r > 0 && start_menu_open) {
+				if (start_menu_keys(buf, r))
+					need_redraw = 1;
+			}
 			/* Swallow keystrokes while Alt is held so Alt+Tab's ESC/Tab bytes
 			 * don't leak into the focused window. */
-			if (r > 0 && !alt_held && focused >= 0 && wins[focused].used) {
+			else if (r > 0 && !alt_held && focused >= 0 && wins[focused].used) {
 				if (wins[focused].type == WIN_BROWSER)
 					browser_keys(buf, r);
 				else if (wins[focused].type == WIN_TERM)
