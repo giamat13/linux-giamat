@@ -61,12 +61,14 @@ void fm_render(struct window *w)
 	if (fm->scroll < 0) fm->scroll = 0;
 }
 
-/* Directories first, then alphabetical. */
+/* Directories first, then by name or (if fm_sort_by_size) by size descending. */
 static int fent_cmp(const void *a, const void *b)
 {
 	const struct fent *x = a, *y = b;
 	if (x->isdir != y->isdir)
 		return y->isdir - x->isdir;
+	if (fm_sort_by_size && x->size != y->size)
+		return (y->size > x->size) - (y->size < x->size);
 	return strcmp(x->name, y->name);
 }
 
@@ -522,8 +524,11 @@ static void fm_toolbar(struct window *w, int btn)
 		fm->pbuf[0] = 0;
 		break;
 	case 2:
-		/* Deleting is irreversible: the first click only arms the button. */
-		if (!fm->confirm_del) {
+		/* Deleting is irreversible: the first click only arms the button --
+		 * unless the "Confirm before delete" setting is off. */
+		if (!confirm_delete) {
+			fm_delete(w);
+		} else if (!fm->confirm_del) {
 			fm->confirm_del = 1;
 			snprintf(fm->status, sizeof(fm->status), "click Delete again to confirm");
 		} else {

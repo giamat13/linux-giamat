@@ -79,17 +79,7 @@ static void do_hit_test(int x, int y)
 				} else if (w->type == WIN_EDIT) {
 					ed_click(w, x, y);
 				} else if (w->type == WIN_SETTINGS) {
-					int t = settings_click(w, x, y);
-					if (t >= 0 && t < NUM_THEMES) {
-						theme_idx = t;
-					} else if (t == NUM_THEMES) {
-						show_hidden = !show_hidden;
-						/* Reload all open file windows and the desktop to show/hide .* files */
-						for (int i = 0; i < MAX_WIN; i++)
-							if (wins[i].used && wins[i].type == WIN_FILES && wins[i].fm)
-								fm_load(&wins[i]);
-						desk_scan();
-					}
+					settings_click(w, x, y);
 				} else if (w->type == WIN_TASKMGR) {
 					taskmgr_click(w, x, y);
 				} else if (w->type == WIN_CALC) {
@@ -634,6 +624,9 @@ int main(void)
 					need_redraw = 1;
 				else if (wins[focused].type == WIN_SEARCH &&
 					 search_keys(&wins[focused], buf, r))
+					need_redraw = 1;
+				else if (wins[focused].type == WIN_SETTINGS &&
+					 settings_keys(&wins[focused], buf, r))
 					need_redraw = 1;
 			}
 		}

@@ -380,7 +380,7 @@ struct window {
 	struct imgstate *img;         /* WIN_IMGVIEW only */
 	struct archivestate *arc;     /* WIN_ARCHIVE only */
 	struct shotstate *shot;       /* WIN_SHOT only */
-	int tab;                  /* WIN_TASKMGR: active tab */
+	int tab;                  /* WIN_TASKMGR / WIN_SETTINGS: active tab */
 
 	int cols, rows;
 	unsigned char gch[GRID_MAXROWS][GRID_MAXCOLS];
@@ -405,6 +405,16 @@ extern const char *fm_btns[FM_NBTN];
 extern int theme_idx;
 extern int show_hidden;         /* show .* files in file manager */
 extern int dblclick_delay;      /* ms: drag icon/row vs. selection threshold */
+
+/* Settings, all real switches read elsewhere -- see settings.c's row
+ * registry for where each one is wired in. */
+extern int clock_24h;           /* taskbar clock: 24h vs 12h */
+extern int clock_show_secs;     /* taskbar clock: include seconds */
+extern int clock_show_date;     /* taskbar clock: prefix with the date */
+extern int wallpaper_solid;     /* desktop background: flat dtop vs the usual gradient */
+extern int show_icon_labels;    /* draw the name under desktop/app icons */
+extern int confirm_delete;      /* File Manager toolbar Delete arms before it fires */
+extern int fm_sort_by_size;     /* File Manager listing: sort by size instead of name */
 
 extern int cpu_hist[HIST], mem_hist[HIST];
 
@@ -564,7 +574,8 @@ int spawn_editor(const char *path);
 
 /* settings.c */
 void draw_settings(struct window *w, int content_y);
-int settings_click(struct window *w, int px, int py);
+void settings_click(struct window *w, int px, int py);
+int settings_keys(struct window *w, const char *buf, int n);
 int spawn_settings(void);
 
 /* calc.c */

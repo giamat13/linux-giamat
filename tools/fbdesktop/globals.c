@@ -43,6 +43,14 @@ int theme_idx;
 int show_hidden;
 int dblclick_delay = 200;
 
+int clock_24h = 1;
+int clock_show_secs = 1;
+int clock_show_date;
+int wallpaper_solid;
+int show_icon_labels = 1;
+int confirm_delete = 1;
+int fm_sort_by_size;
+
 int cpu_hist[HIST], mem_hist[HIST];
 
 int icon_press = -1;

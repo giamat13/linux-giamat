@@ -116,9 +116,11 @@ static void draw_icons(void)
 		draw_glyph(ic->glyph, tx + TILE / 2, ty + TILE / 2,
 			   0xffffff, mix(c, 0x000000, 78));
 
-		int len = strlen(ic->label);
-		int lx = ic->x + (ICON_W - len * font_w) / 2;
-		draw_text(lx, ty + TILE + 9, ic->label, 0xdfe4f2);
+		if (show_icon_labels) {
+			int len = strlen(ic->label);
+			int lx = ic->x + (ICON_W - len * font_w) / 2;
+			draw_text(lx, ty + TILE + 9, ic->label, 0xdfe4f2);
+		}
 	}
 
 	for (int i = 0; i < desk_count; i++) {
@@ -137,7 +139,8 @@ static void draw_icons(void)
 				     mix(c, 0x000000, 55));
 		draw_glyph(fcat_glyph(cat), tx + TILE / 2, ty + TILE / 2,
 			   0xffffff, mix(c, 0x000000, 78));
-		draw_text_clip(x, ty + TILE + 9, df->name, 0xdfe4f2, ICON_W);
+		if (show_icon_labels)
+			draw_text_clip(x, ty + TILE + 9, df->name, 0xdfe4f2, ICON_W);
 	}
 }
 
@@ -391,10 +394,25 @@ static void draw_taskbar(void)
 		bx += bw + 6;
 	}
 
-	char timebuf[24];
+	char timebuf[40];
 	time_t t = time(NULL);
 	struct tm *tm = localtime(&t);
-	snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
+	int hour = clock_24h ? tm->tm_hour : (tm->tm_hour % 12 == 0 ? 12 : tm->tm_hour % 12);
+	char clk[24];
+	if (clock_show_secs)
+		snprintf(clk, sizeof(clk), "%02d:%02d:%02d%s", hour, tm->tm_min, tm->tm_sec,
+			 clock_24h ? "" : (tm->tm_hour < 12 ? " AM" : " PM"));
+	else
+		snprintf(clk, sizeof(clk), "%02d:%02d%s", hour, tm->tm_min,
+			 clock_24h ? "" : (tm->tm_hour < 12 ? " AM" : " PM"));
+	if (clock_show_date) {
+		char datebuf[16];
+		snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", tm->tm_year + 1900,
+			 tm->tm_mon + 1, tm->tm_mday);
+		snprintf(timebuf, sizeof(timebuf), "%s  %s", datebuf, clk);
+	} else {
+		snprintf(timebuf, sizeof(timebuf), "%s", clk);
+	}
 	int tw = (int)strlen(timebuf) * font_w;
 	int cx = sx - 12 - tw; /* clock sits left of the show-desktop button */
 	fill_rect(cx - 12, ty + 9, 1, TASK_H - 18, 0x3a3a4d);
@@ -488,8 +506,11 @@ static void draw_fmdrag(void)
 
 void redraw_all(void)
 {
-	fill_vgradient(0, 0, xres, yres - TASK_H,
-		       themes[theme_idx].dtop, themes[theme_idx].dbot);
+	if (wallpaper_solid)
+		fill_rect(0, 0, xres, yres - TASK_H, themes[theme_idx].dtop);
+	else
+		fill_vgradient(0, 0, xres, yres - TASK_H,
+			       themes[theme_idx].dtop, themes[theme_idx].dbot);
 	draw_icons();
 	for (int zi = 0; zi < zcount; zi++) {
 		int i = zorder[zi];
