@@ -10,7 +10,7 @@ A fork of the Linux kernel (7.2-rc3) plus a small out-of-tree userspace experime
 - `build-rootfs.sh` / `build-initramfs.sh` / `build-iso.sh` — package the kernel + a Debian rootfs + fbdesktop into a bootable ISO.
 - Local netfilter changes (`net/netfilter/xt_{hl,dscp,rateest,tcpmss}.c` and their uapi headers, commit `1db51fc`).
 
-This list describes where past changes happened to land, not a restriction on where future ones may land. Pick whichever files the task actually needs — including kernel subsystems, Kconfig, or drivers — rather than defaulting to the userspace desktop out of habit.
+This list describes where past changes happened to land, **not a restriction on where future ones may land, and not a list of the only directories you're allowed to edit.** There is no allowlist of editable paths in this repo — every file, including files never touched before (kernel core, `arch/`, `drivers/`, `Kconfig`, `Documentation/`, anywhere else upstream) is fair game when the task needs it. Pick whichever files the task actually needs — including kernel subsystems, Kconfig, or drivers — rather than defaulting to the userspace desktop (`tools/fbdesktop/`, `tools/apps/`) out of habit just because that's where most past work happened to land.
 
 **Priority order when choosing an approach and which files to touch:**
 1. Correctness and quality first — the result must actually be the best solution to the task (and must still satisfy "must boot on real hardware" below). Never downgrade quality to save cost.
