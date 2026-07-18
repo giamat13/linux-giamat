@@ -9,6 +9,7 @@
 #define SH_TXT  0xcdd6f4
 #define SH_DIM  0x6c7086
 #define SH_TOOLH 36
+#define SH_DIR DESKTOP_DIR "/Screenshots"
 
 static void wr_le16(unsigned char *p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
 static void wr_le32(unsigned char *p, uint32_t v)
@@ -65,8 +66,9 @@ void shot_click(struct window *w, int px, int py)
 	if (py < content_y || py >= content_y + SH_TOOLH || px < w->x + 8 || px >= w->x + 8 + bw)
 		return;
 
+	mkdir(SH_DIR, 0755); /* ignore EEXIST -- it's fine if it's already there */
 	char path[FM_FULLLEN];
-	snprintf(path, sizeof(path), "%s/screenshot-%ld.bmp", DESKTOP_DIR, (long)time(NULL));
+	snprintf(path, sizeof(path), "%s/screenshot-%ld.bmp", SH_DIR, (long)time(NULL));
 	if (save_bmp(path) == 0) {
 		s->count++;
 		snprintf(s->status, sizeof(s->status), "saved %s", strrchr(path, '/') + 1);
