@@ -158,6 +158,19 @@ void archive_click(struct window *w, int px, int py)
 	}
 }
 
+void archive_scroll(struct window *w, int value)
+{
+	struct archivestate *a = w->arc;
+	int content_h = w->h - TITLE_H;
+	int visible = (content_h - AR_TOOLH) > 0 ? (content_h - AR_TOOLH) / AR_ROWH : 0;
+	int maxscroll = a->count - visible;
+	if (maxscroll < 0)
+		maxscroll = 0;
+	a->scroll -= value;
+	if (a->scroll < 0) a->scroll = 0;
+	if (a->scroll > maxscroll) a->scroll = maxscroll;
+}
+
 /* ---- renderer ------------------------------------------------------------ */
 
 void draw_archive(struct window *w, int content_y, int content_h)

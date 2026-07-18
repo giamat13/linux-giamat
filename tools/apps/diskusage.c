@@ -131,6 +131,18 @@ int du_panel_click(struct dustate *s, int rx, int ry, int rw, int rh, int px, in
 	return 1;
 }
 
+void du_panel_scroll(struct dustate *s, int rh, int value)
+{
+	int list_h = rh - DU_TOOLH;
+	int visible = list_h > 0 ? list_h / DU_ROWH : 0;
+	int maxscroll = s->count - visible;
+	if (maxscroll < 0)
+		maxscroll = 0;
+	s->scroll -= value;
+	if (s->scroll < 0) s->scroll = 0;
+	if (s->scroll > maxscroll) s->scroll = maxscroll;
+}
+
 /* ---- renderer: draws only within (x,y,w,h), never touches the rest of the tab */
 
 void draw_du_panel(struct dustate *s, uint32_t accent, int x, int y, int w, int h)

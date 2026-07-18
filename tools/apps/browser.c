@@ -229,6 +229,21 @@ void browser_pointer(int lx, int ly, int left, int right)
 	XFlush(xdpy);
 }
 
+/* Wheel ticks have no X11 motion counterpart -- they're button 4 (up) /
+ * button 5 (down) click-and-release at wherever the pointer already is. */
+void browser_wheel(int value)
+{
+	if (!xdpy)
+		return;
+	int button = value > 0 ? 4 : 5;
+	int ticks = value > 0 ? value : -value;
+	for (int i = 0; i < ticks; i++) {
+		XTestFakeButtonEvent(xdpy, button, True, 0);
+		XTestFakeButtonEvent(xdpy, button, False, 0);
+	}
+	XFlush(xdpy);
+}
+
 static void browser_tap(KeySym ks)
 {
 	KeyCode kc = XKeysymToKeycode(xdpy, ks);

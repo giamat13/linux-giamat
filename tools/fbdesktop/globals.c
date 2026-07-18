@@ -96,7 +96,7 @@ int have_font;
 int font_w = 8, font_h = 16, font_bpr = 1;
 int mx, my, prev_left, prev_right;
 int confd = -1;
-int absptr_fd = -1, kbd_evdev_fd = -1;
+int absptr_fd = -1, kbd_evdev_fd = -1, wheel_fd = -1;
 int abs_minx, abs_maxx, abs_miny, abs_maxy;
 int abs_curx, abs_cury, abs_btn, abs_rbtn;
 FILE *dbg;

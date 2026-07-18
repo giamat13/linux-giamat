@@ -470,7 +470,7 @@ extern int mx, my, prev_left, prev_right;
 /* /dev/tty1, kept open so the console mode can be handed back and forth with X */
 extern int confd;
 /* absolute pointer (evdev tablet) + evdev keyboard for Alt+Tab */
-extern int absptr_fd, kbd_evdev_fd;
+extern int absptr_fd, kbd_evdev_fd, wheel_fd;
 extern int abs_minx, abs_maxx, abs_miny, abs_maxy;
 extern int abs_curx, abs_cury, abs_btn, abs_rbtn;
 extern FILE *dbg;
@@ -538,6 +538,7 @@ uint32_t win_accent(const struct window *w);
 extern int browser_win;   /* window slot showing Firefox, -1 = not running */
 void browser_keys(const char *buf, int n);
 void browser_pointer(int lx, int ly, int left, int right);
+void browser_wheel(int value);
 void browser_teardown(void);
 void draw_browser(struct window *w);
 int spawn_browser(void);
@@ -550,6 +551,7 @@ void sample_stats(void);
 int spawn_taskmgr(void);
 void taskmgr_refresh(struct window *w);
 void taskmgr_click(struct window *w, int px, int py);
+void taskmgr_disk_scroll(struct window *w, int value);
 
 /* files.c */
 int ctxmenu_click(int x, int y);
@@ -609,12 +611,14 @@ int spawn_timer(void);
 void draw_search(struct window *w, int content_y, int content_h);
 void search_click(struct window *w, int px, int py);
 int search_keys(struct window *w, const char *buf, int n);
+void search_scroll(struct window *w, int value);
 int spawn_search(void);
 
 /* diskusage.c -- Folder Usage panel embedded in the Task Manager's Disk tab */
 void du_scan(struct dustate *s);
 void draw_du_panel(struct dustate *s, uint32_t accent, int x, int y, int w, int h);
 int du_panel_click(struct dustate *s, int rx, int ry, int rw, int rh, int px, int py);
+void du_panel_scroll(struct dustate *s, int rh, int value);
 
 /* imgview.c */
 void draw_imgview(struct window *w, int content_y, int content_h);
@@ -624,6 +628,7 @@ int spawn_imgview(const char *path);
 /* archive.c */
 void draw_archive(struct window *w, int content_y, int content_h);
 void archive_click(struct window *w, int px, int py);
+void archive_scroll(struct window *w, int value);
 int spawn_archive(const char *path);
 int archive_create(const char *srcpath);
 
@@ -634,6 +639,7 @@ int spawn_shot(void);
 
 /* main.c */
 int process_pointer(int nx, int ny, int left, int right);
+int process_scroll(int value);
 void launch_icon(int idx);
 
 #endif /* FBDESKTOP_H */

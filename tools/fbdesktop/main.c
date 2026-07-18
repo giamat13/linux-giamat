@@ -313,6 +313,40 @@ int process_pointer(int nx, int ny, int left, int right)
 	return changed;
 }
 
+/* One wheel tick, value>0 meaning "up" (evdev convention): finds whichever
+ * window the pointer currently sits over -- not necessarily the focused one,
+ * matching how wheel scroll behaves everywhere else -- and routes it to that
+ * type's scroll state. Windows with no independent scroll viewport (the
+ * terminal, calc, paint, timer, settings, the editor's caret-follows-scroll
+ * model) simply don't match any case here. */
+int process_scroll(int value)
+{
+	for (int zi = zcount - 1; zi >= 0; zi--) {
+		int i = zorder[zi];
+		if (!wins[i].used || wins[i].minimized)
+			continue;
+		struct window *w = &wins[i];
+		if (mx < w->x || mx >= w->x + w->w || my < w->y || my >= w->y + w->h)
+			continue;
+		if (w->type == WIN_FILES && w->fm) {
+			w->fm->scroll -= value;
+			fm_render(w);
+		} else if (w->type == WIN_SEARCH && w->search) {
+			search_scroll(w, value);
+		} else if (w->type == WIN_ARCHIVE && w->arc) {
+			archive_scroll(w, value);
+		} else if (w->type == WIN_TASKMGR && w->tab == 2) {
+			taskmgr_disk_scroll(w, value);
+		} else if (w->type == WIN_BROWSER) {
+			browser_wheel(value);
+		} else {
+			return 0;
+		}
+		return 1;
+	}
+	return 0;
+}
+
 /* PS/2 relative fallback (real mouse / touchpad, no absolute device). */
 static int handle_mouse_packet(unsigned char *pkt)
 {
@@ -371,6 +405,19 @@ static int read_kbd_evdev(void)
 	return changed;
 }
 
+/* Read wheel ticks off wheel_fd and hand each one to process_scroll(). */
+static int read_wheel(void)
+{
+	struct input_event ev;
+	int changed = 0;
+	while (read(wheel_fd, &ev, sizeof(ev)) == (int)sizeof(ev)) {
+		if (ev.type == EV_REL && ev.code == REL_WHEEL && ev.value != 0)
+			if (process_scroll(ev.value))
+				changed = 1;
+	}
+	return changed;
+}
+
 static void scan_input_devices(void)
 {
 	for (int i = 0; i < 32; i++) {
@@ -382,8 +429,9 @@ static void scan_input_devices(void)
 		unsigned char evbit[(EV_MAX + 7) / 8] = {0};
 		unsigned char absbit[(ABS_MAX + 7) / 8] = {0};
 		unsigned char keybit[(KEY_MAX + 7) / 8] = {0};
+		unsigned char relbit[(REL_MAX + 7) / 8] = {0};
 		ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
-		int is_abs = 0, is_kbd = 0;
+		int is_abs = 0, is_kbd = 0, is_wheel = 0;
 		if (test_bit(EV_ABS, evbit)) {
 			ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbit)), absbit);
 			if (test_bit(ABS_X, absbit) && test_bit(ABS_Y, absbit))
@@ -393,6 +441,11 @@ static void scan_input_devices(void)
 			ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
 			if (test_bit(KEY_A, keybit) && test_bit(KEY_ENTER, keybit))
 				is_kbd = 1;
+		}
+		if (test_bit(EV_REL, evbit)) {
+			ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relbit)), relbit);
+			if (test_bit(REL_WHEEL, relbit))
+				is_wheel = 1;
 		}
 		if (is_abs && absptr_fd < 0) {
 			absptr_fd = fd;
@@ -405,6 +458,15 @@ static void scan_input_devices(void)
 		if (is_kbd && kbd_evdev_fd < 0) {
 			kbd_evdev_fd = fd;
 			DBG("[input] keyboard %s\n", path);
+			continue;
+		}
+		/* Read directly off the wheel's own evdev node for REL_WHEEL only --
+		 * independent of however cursor movement/clicks reach us (absolute
+		 * tablet or the /dev/input/mice legacy multiplexer), so this can't
+		 * disturb either of those paths. */
+		if (is_wheel && wheel_fd < 0) {
+			wheel_fd = fd;
+			DBG("[input] wheel %s\n", path);
 			continue;
 		}
 		close(fd);
@@ -510,9 +572,9 @@ int main(void)
 	redraw_all();
 
 	for (;;) {
-		struct pollfd fds[4 + MAX_WIN];
+		struct pollfd fds[5 + MAX_WIN];
 		int n = 0;
-		int mouse_i = -1, abs_i = -1, kev_i = -1, kbd_i;
+		int mouse_i = -1, abs_i = -1, kev_i = -1, wheel_i = -1, kbd_i;
 		if (mousefd >= 0) {
 			mouse_i = n;
 			fds[n].fd = mousefd;
@@ -528,6 +590,12 @@ int main(void)
 		if (kbd_evdev_fd >= 0) {
 			kev_i = n;
 			fds[n].fd = kbd_evdev_fd;
+			fds[n].events = POLLIN;
+			n++;
+		}
+		if (wheel_fd >= 0) {
+			wheel_i = n;
+			fds[n].fd = wheel_fd;
 			fds[n].events = POLLIN;
 			n++;
 		}
@@ -591,6 +659,10 @@ int main(void)
 		}
 		if (kev_i >= 0 && (fds[kev_i].revents & POLLIN)) {
 			if (read_kbd_evdev())
+				need_redraw = 1;
+		}
+		if (wheel_i >= 0 && (fds[wheel_i].revents & POLLIN)) {
+			if (read_wheel())
 				need_redraw = 1;
 		}
 		if (fds[kbd_i].revents & POLLIN) {

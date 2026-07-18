@@ -121,6 +121,18 @@ void search_click(struct window *w, int px, int py)
 	}
 }
 
+void search_scroll(struct window *w, int value)
+{
+	struct searchstate *s = w->search;
+	int content_h = w->h - TITLE_H;
+	int maxscroll = s->nres - search_visible_rows(w, content_h);
+	if (maxscroll < 0)
+		maxscroll = 0;
+	s->scroll -= value;
+	if (s->scroll < 0) s->scroll = 0;
+	if (s->scroll > maxscroll) s->scroll = maxscroll;
+}
+
 int search_keys(struct window *w, const char *buf, int n)
 {
 	struct searchstate *s = w->search;

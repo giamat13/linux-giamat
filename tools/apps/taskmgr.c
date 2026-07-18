@@ -598,6 +598,13 @@ void draw_taskmgr(struct window *w, int content_y, int content_h)
 		}
 }
 
+void taskmgr_disk_scroll(struct window *w, int value)
+{
+	int rx, ry, rw, rh;
+	disk_panel_rect(w, &rx, &ry, &rw, &rh);
+	du_panel_scroll(&du_state, rh, value);
+}
+
 /* Sidebar / row / button hit testing. */
 void taskmgr_click(struct window *w, int px, int py)
 {
