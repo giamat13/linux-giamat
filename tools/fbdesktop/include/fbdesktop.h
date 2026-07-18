@@ -184,6 +184,11 @@ struct fmstate {
  * back. Sits at the far right of the taskbar, to the right of the clock. */
 #define SD_W 34
 
+/* Start Menu button + popup, far left of the taskbar. */
+#define START_W  44
+#define SM_W     200
+#define SM_ROWH  26
+
 /* Text editor state, allocated only for WIN_EDIT windows. */
 #define ED_MAXLINES 1024
 #define ED_MAXCOL 240
@@ -441,6 +446,7 @@ extern int drag_win;
 extern int alt_held;
 extern int sd_active;      /* "show desktop" is on: everything was minimized */
 extern int sd_saved[MAX_WIN];
+extern int start_menu_open;
 
 extern uint8_t *fbp;      /* real framebuffer */
 extern uint8_t *backbuf;  /* offscreen: draw here, then flush in one memcpy */
@@ -494,6 +500,10 @@ void redraw_all(void);
 int sd_x(void);
 int task_limit(void);
 void toggle_show_desktop(void);
+int start_x(void);
+int start_hit(int px, int py);
+int start_menu_row_at(int px, int py);
+void draw_start_menu(void);
 
 /* term.c */
 void clear_row_range(struct window *w, int row, int from, int to);
@@ -540,6 +550,7 @@ int fm_keys(struct window *w, const char *buf, int n);
 void fm_load(struct window *w);
 void fm_open_selected(int winidx, int entidx);
 void fm_render(struct window *w);
+void open_regular_file(const char *path, const char *name, int isexec);
 int spawn_file_window(void);
 
 /* editor.c */
@@ -610,5 +621,6 @@ int spawn_shot(void);
 
 /* main.c */
 int process_pointer(int nx, int ny, int left, int right);
+void launch_icon(int idx);
 
 #endif /* FBDESKTOP_H */

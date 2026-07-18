@@ -199,9 +199,48 @@ void desk_scan(void)
 	qsort(desk_files, desk_count, sizeof(struct deskfile), deskfile_cmp);
 }
 
+/* Start Menu: a button at the far left of the taskbar that pops up every
+ * icon (apps, reboot, power off) as a plain list -- the same launch_icon()
+ * a desktop double-click uses, so opening from the menu behaves identically. */
+int start_x(void) { return 6; }
+
+static int start_menu_h(void) { return NUM_ICONS * SM_ROWH + 8; }
+static int start_menu_y(void) { return yres - TASK_H - start_menu_h() - 6; }
+
+int start_hit(int px, int py)
+{
+	int ty = yres - TASK_H;
+	return px >= start_x() && px < start_x() + START_W &&
+	       py >= ty + 5 && py < ty + TASK_H - 5;
+}
+
+/* -1 if the click missed the popup entirely (caller still closes the menu). */
+int start_menu_row_at(int px, int py)
+{
+	int mx0 = start_x(), my0 = start_menu_y();
+	if (px < mx0 || px >= mx0 + SM_W || py < my0 || py >= my0 + start_menu_h())
+		return -1;
+	int row = (py - my0 - 4) / SM_ROWH;
+	return (row >= 0 && row < NUM_ICONS) ? row : -1;
+}
+
+void draw_start_menu(void)
+{
+	if (!start_menu_open)
+		return;
+	int mx0 = start_x(), my0 = start_menu_y(), mh = start_menu_h();
+	fill_round_rect(mx0 + 3, my0 + 4, SM_W, mh, 6, 0x0a0a11);
+	fill_round_rect(mx0, my0, SM_W, mh, 6, 0x2e2e3c);
+	for (int i = 0; i < NUM_ICONS; i++) {
+		int ry = my0 + 4 + i * SM_ROWH;
+		fill_circle(mx0 + 16, ry + SM_ROWH / 2, 6, icons[i].color);
+		draw_text_clip(mx0 + 30, ry + (SM_ROWH - font_h) / 2, icons[i].label,
+			       0xdfe4f2, SM_W - 38);
+	}
+}
+
 /* "Show desktop": minimize everything, click again to bring it all back.
  * Sits at the far right of the taskbar, to the right of the clock. */
-
 
 int sd_x(void)
 {
@@ -236,6 +275,17 @@ static void draw_taskbar(void)
 	int ty = yres - TASK_H;
 	fill_vgradient(0, ty, xres, TASK_H, 0x1c1c2a, 0x101018);
 	fill_rect(0, ty, xres, 1, 0x3a3a4d);
+
+	/* start button: a small 2x2 grid, like the show-desktop button's screen glyph */
+	int stx = start_x(), sty2 = ty + 5, sth = TASK_H - 10;
+	fill_round_rect_grad(stx, sty2, START_W, sth, 5,
+			     start_menu_open ? 0x4a4c63 : 0x2b2b3a,
+			     start_menu_open ? 0x393b52 : 0x22222e);
+	uint32_t stc = start_menu_open ? themes[theme_idx].accent : 0x9399b2;
+	fill_round_rect(stx + 9,  sty2 + 6,  8, 8, 2, stc);
+	fill_round_rect(stx + 22, sty2 + 6,  8, 8, 2, stc);
+	fill_round_rect(stx + 9,  sty2 + 17, 8, 8, 2, stc);
+	fill_round_rect(stx + 22, sty2 + 17, 8, 8, 2, stc);
 
 	/* show-desktop button: a small stylized screen */
 	int sy = ty + 5, sh = TASK_H - 10, sx = sd_x();
@@ -373,6 +423,7 @@ void redraw_all(void)
 			draw_window(&wins[i]);
 	}
 	draw_taskbar();
+	draw_start_menu();
 	draw_ctxmenu();
 	draw_fmdrag();
 	draw_cursor(mx, my);

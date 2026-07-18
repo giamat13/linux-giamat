@@ -76,6 +76,7 @@ int drag_win = -1;
 int alt_held;
 int sd_active;
 int sd_saved[MAX_WIN];
+int start_menu_open;
 
 uint8_t *fbp;
 uint8_t *backbuf;

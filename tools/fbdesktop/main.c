@@ -4,12 +4,23 @@
 
 static void do_hit_test(int x, int y)
 {
+	if (start_menu_open) {
+		int row = start_menu_row_at(x, y);
+		start_menu_open = 0;
+		if (row >= 0)
+			launch_icon(row);
+		return; /* any click while the menu is open just closes it */
+	}
 	if (y >= yres - TASK_H) {
+		if (start_hit(x, y)) {
+			start_menu_open = 1;
+			return;
+		}
 		if (x >= sd_x() && x < sd_x() + SD_W) {
 			toggle_show_desktop();
 			return;
 		}
-		int bx = 8;
+		int bx = start_x() + START_W + 8;
 		for (int zi = 0; zi < zcount; zi++) {
 			int i = zorder[zi];
 			if (!wins[i].used)
@@ -121,7 +132,7 @@ static void do_hit_test(int x, int y)
 	}
 }
 
-static void launch_icon(int idx)
+void launch_icon(int idx)
 {
 	struct icon *ic = &icons[idx];
 	if (ic->action == 1) {
@@ -179,7 +190,7 @@ static void launch_deskfile(int i)
 			fm_load(&wins[slot]);
 		}
 	} else {
-		spawn_editor(path);
+		open_regular_file(path, df->name, df->isexec);
 	}
 }
 

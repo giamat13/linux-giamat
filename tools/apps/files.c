@@ -553,16 +553,24 @@ void fm_open_selected(int winidx, int entidx)
 		fm_load(w);
 	} else if (e->isreg) {
 		/* Regular files only: opening a fifo or char device would block forever. */
-		enum fcat cat = classify_file(e->name, 0, e->isexec);
-		const char *dot = strrchr(e->name, '.');
-		if (cat == FCAT_IMAGE && dot && (!strcasecmp(dot, ".ppm") || !strcasecmp(dot, ".bmp")))
-			spawn_imgview(path);
-		else if (cat == FCAT_ARCHIVE && dot &&
-			 (!strcasecmp(dot, ".tar") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tgz")))
-			spawn_archive(path);
-		else
-			spawn_editor(path);
+		open_regular_file(path, e->name, e->isexec);
 	}
+}
+
+/* Open a regular file the way double-clicking it should: the viewer/manager
+ * that matches its type, falling back to the text editor. Shared by the file
+ * manager listing and the desktop icons, so the two can't drift apart. */
+void open_regular_file(const char *path, const char *name, int isexec)
+{
+	enum fcat cat = classify_file(name, 0, isexec);
+	const char *dot = strrchr(name, '.');
+	if (cat == FCAT_IMAGE && dot && (!strcasecmp(dot, ".ppm") || !strcasecmp(dot, ".bmp")))
+		spawn_imgview(path);
+	else if (cat == FCAT_ARCHIVE && dot &&
+		 (!strcasecmp(dot, ".tar") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tgz")))
+		spawn_archive(path);
+	else
+		spawn_editor(path);
 }
 
 /* Drop the file that was being dragged (fmdrag_win/fmdrag_entidx) at (x,y):
