@@ -98,6 +98,8 @@ static void do_hit_test(int x, int y)
 					archive_click(w, x, y);
 				} else if (w->type == WIN_SHOT) {
 					shot_click(w, x, y);
+				} else if (w->type == WIN_PDFVIEW) {
+					pdfview_click(w, x, y);
 				}
 				return;
 			}
