@@ -595,6 +595,8 @@ void open_regular_file(const char *path, const char *name, int isexec)
 	else if (cat == FCAT_ARCHIVE && dot &&
 		 (!strcasecmp(dot, ".tar") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tgz")))
 		spawn_archive(path);
+	else if (cat == FCAT_PDF)
+		spawn_pdfview(path);
 	else
 		spawn_editor(path);
 }

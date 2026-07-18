@@ -36,7 +36,8 @@ chroot "$ROOTFS" /bin/bash -c '
 	# keymap it can compile, even though nothing here has a real keyboard.
 	apt-get install -y --no-install-recommends \
 		xvfb xkb-data x11-xkb-utils firefox-esr fonts-dejavu-core \
-		ca-certificates dbus-x11 libgl1-mesa-dri libx11-6 libxext6 libxtst6
+		ca-certificates dbus-x11 libgl1-mesa-dri libx11-6 libxext6 libxtst6 \
+		poppler-utils
 	apt-get clean
 '
 

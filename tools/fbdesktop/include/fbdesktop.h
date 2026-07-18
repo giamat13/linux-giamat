@@ -75,7 +75,7 @@
 
 enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS,
 	       WIN_BROWSER, WIN_CALC, WIN_PAINT, WIN_CAL, WIN_TIMER, WIN_SEARCH,
-	       WIN_IMGVIEW, WIN_ARCHIVE, WIN_SHOT };
+	       WIN_IMGVIEW, WIN_ARCHIVE, WIN_SHOT, WIN_PDFVIEW };
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
@@ -88,7 +88,7 @@ enum glyph {
  * FCAT_EXEC covers extensionless system binaries (busybox, /init, and the
  * whole /bin, /sbin symlink farm): without it they'd be indistinguishable
  * from any other extensionless file under FCAT_OTHER. */
-enum fcat { FCAT_DIR, FCAT_IMAGE, FCAT_ARCHIVE, FCAT_CODE, FCAT_TEXT, FCAT_EXEC, FCAT_OTHER };
+enum fcat { FCAT_DIR, FCAT_IMAGE, FCAT_ARCHIVE, FCAT_CODE, FCAT_TEXT, FCAT_PDF, FCAT_EXEC, FCAT_OTHER };
 
 struct icon {
 	const char *label;
@@ -360,6 +360,21 @@ struct shotstate {
 	char status[64];
 };
 
+/* PDF Viewer state, allocated only for WIN_PDFVIEW windows. Pages are
+ * rasterized on demand by the system `pdftoppm` (poppler-utils) into a
+ * private /tmp directory and decoded with imgview.c's PPM loader -- no PDF
+ * parser of our own. One page's pixels live at a time; Next/Prev just
+ * re-render, and a render that produces no file means "no such page" (so
+ * total page count is never needed up front). */
+struct pdfstate {
+	char path[FM_FULLLEN];
+	char tmpdir[FM_FULLLEN];
+	int page;
+	unsigned char *rgb;
+	int iw, ih;
+	char status[64];
+};
+
 struct window {
 	int used;
 	enum wintype type;
@@ -380,6 +395,7 @@ struct window {
 	struct imgstate *img;         /* WIN_IMGVIEW only */
 	struct archivestate *arc;     /* WIN_ARCHIVE only */
 	struct shotstate *shot;       /* WIN_SHOT only */
+	struct pdfstate *pdf;         /* WIN_PDFVIEW only */
 	int tab;                  /* WIN_TASKMGR / WIN_SETTINGS: active tab */
 
 	int cols, rows;
@@ -640,6 +656,14 @@ int run_argv_wait(char *const argv[]);
 void draw_shot(struct window *w, int content_y, int content_h);
 void shot_click(struct window *w, int px, int py);
 int spawn_shot(void);
+
+/* pdfview.c */
+void draw_pdfview(struct window *w, int content_y, int content_h);
+void pdfview_click(struct window *w, int px, int py);
+int spawn_pdfview(const char *path);
+
+/* imgview.c PPM decoder, reused by pdfview.c for pdftoppm's output */
+int load_ppm(const char *path, unsigned char **out_rgb, int *ow, int *oh);
 
 /* main.c */
 int process_pointer(int nx, int ny, int left, int right);

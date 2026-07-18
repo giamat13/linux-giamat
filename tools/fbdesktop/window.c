@@ -73,6 +73,15 @@ void close_window(int i)
 		free(wins[i].shot);
 		wins[i].shot = NULL;
 	}
+	if (wins[i].pdf) {
+		/* best-effort scratch cleanup: pages are unlinked as we go, so the
+		 * dir is normally already empty by now */
+		if (wins[i].pdf->tmpdir[0])
+			rmdir(wins[i].pdf->tmpdir);
+		free(wins[i].pdf->rgb);
+		free(wins[i].pdf);
+		wins[i].pdf = NULL;
+	}
 	wins[i].used = 0;
 	for (int zi = 0; zi < zcount; zi++) {
 		if (zorder[zi] == i) {
@@ -229,6 +238,11 @@ void draw_window(struct window *w)
 
 	if (w->type == WIN_SHOT && w->shot) {
 		draw_shot(w, content_y, content_h);
+		return;
+	}
+
+	if (w->type == WIN_PDFVIEW && w->pdf) {
+		draw_pdfview(w, content_y, content_h);
 		return;
 	}
 

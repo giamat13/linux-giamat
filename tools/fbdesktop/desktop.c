@@ -26,6 +26,8 @@ enum fcat classify_file(const char *name, int isdir, int isexec)
 	if (!strcmp(ext, "txt") || !strcmp(ext, "md") || !strcmp(ext, "log") ||
 	    !strcmp(ext, "conf") || !strcmp(ext, "cfg"))
 		return FCAT_TEXT;
+	if (!strcmp(ext, "pdf"))
+		return FCAT_PDF;
 	return isexec ? FCAT_EXEC : FCAT_OTHER;
 }
 
@@ -36,6 +38,7 @@ uint32_t fcat_color(enum fcat c)
 	case FCAT_IMAGE:   return 0xf9a825;
 	case FCAT_ARCHIVE: return 0xa0785a;
 	case FCAT_CODE:    return 0x22c55e;
+	case FCAT_PDF:     return 0xef4444;
 	case FCAT_EXEC:    return 0xf43f5e;
 	default:           return 0x94a3b8; /* TEXT and OTHER: same neutral as before */
 	}
@@ -48,6 +51,7 @@ static int fcat_glyph(enum fcat c)
 	case FCAT_IMAGE:   return G_IMAGE;
 	case FCAT_ARCHIVE: return G_ARCHIVE;
 	case FCAT_CODE:    return G_CODE;
+	case FCAT_PDF:     return G_FILE;
 	case FCAT_EXEC:    return G_EXEC;
 	default:           return G_FILE;
 	}
@@ -62,6 +66,7 @@ const char *fcat_tag(enum fcat c)
 	case FCAT_ARCHIVE: return "[ZIP]";
 	case FCAT_CODE:    return "[SRC]";
 	case FCAT_TEXT:    return "[TXT]";
+	case FCAT_PDF:     return "[PDF]";
 	case FCAT_EXEC:    return "[BIN]";
 	default:           return "     ";
 	}
