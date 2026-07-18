@@ -369,6 +369,13 @@ static int read_abs_pointer(void)
 		if (ev.type == EV_ABS) {
 			if (ev.code == ABS_X) abs_curx = ev.value;
 			else if (ev.code == ABS_Y) abs_cury = ev.value;
+		} else if (ev.type == EV_REL && ev.code == REL_WHEEL && ev.value != 0) {
+			/* QEMU's usb-tablet (and many real absolute pointers) carry the
+			 * wheel on this same node, not on a separate mouse -- so the
+			 * ticks arrive here, and dropping them was why scroll did
+			 * nothing. See read_wheel for the dedicated-device path. */
+			if (process_scroll(ev.value))
+				changed = 1;
 		} else if (ev.type == EV_KEY) {
 			if (ev.code == BTN_LEFT || ev.code == BTN_TOUCH)
 				abs_btn = ev.value ? 1 : 0;
@@ -418,6 +425,10 @@ static int read_wheel(void)
 	return changed;
 }
 
+/* Set once the absolute pointer we picked turns out to carry REL_WHEEL, so
+ * we don't also grab a separate wheel node and double every tick. */
+static int abs_has_wheel;
+
 static void scan_input_devices(void)
 {
 	for (int i = 0; i < 32; i++) {
@@ -449,10 +460,13 @@ static void scan_input_devices(void)
 		}
 		if (is_abs && absptr_fd < 0) {
 			absptr_fd = fd;
+			if (is_wheel)
+				abs_has_wheel = 1; /* the wheel lives on this node; read_abs_pointer handles it */
 			struct input_absinfo ai;
 			if (ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0) { abs_minx = ai.minimum; abs_maxx = ai.maximum; }
 			if (ioctl(fd, EVIOCGABS(ABS_Y), &ai) == 0) { abs_miny = ai.minimum; abs_maxy = ai.maximum; }
-			DBG("[input] abs pointer %s x[%d..%d] y[%d..%d]\n", path, abs_minx, abs_maxx, abs_miny, abs_maxy);
+			DBG("[input] abs pointer %s x[%d..%d] y[%d..%d]%s\n", path, abs_minx, abs_maxx,
+			    abs_miny, abs_maxy, is_wheel ? " (+wheel)" : "");
 			continue;
 		}
 		if (is_kbd && kbd_evdev_fd < 0) {
@@ -464,7 +478,10 @@ static void scan_input_devices(void)
 		 * independent of however cursor movement/clicks reach us (absolute
 		 * tablet or the /dev/input/mice legacy multiplexer), so this can't
 		 * disturb either of those paths. */
-		if (is_wheel && wheel_fd < 0) {
+		/* Only worth a dedicated node when the absolute pointer isn't already
+		 * carrying the wheel itself -- otherwise both would fire per tick and
+		 * scroll would move at double speed. */
+		if (is_wheel && wheel_fd < 0 && !abs_has_wheel) {
 			wheel_fd = fd;
 			DBG("[input] wheel %s\n", path);
 			continue;
