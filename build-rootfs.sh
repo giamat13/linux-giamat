@@ -79,8 +79,8 @@ mount -t tmpfs none /run
 # Without a hostname the machine is literally "(none)", and xauth then builds the
 # display name "(none):0". It also has to resolve, or xauth rejects it and X
 # comes up with no cookie for Firefox to authenticate against.
-hostname linux-giamat
-echo "127.0.0.1 localhost linux-giamat" > /etc/hosts
+hostname linux-htl
+echo "127.0.0.1 localhost linux-htl" > /etc/hosts
 # Xvfb needs this to exist and be world-writable, or it cannot bind its socket.
 mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
@@ -89,7 +89,7 @@ export HOME=/root
 # the only way to inspect a running system (and it costs nothing on real HW).
 setsid /bin/sh < /dev/ttyS0 > /dev/ttyS0 2>&1 &
 echo "=================================================="
-echo " Custom Linux fork - built from linux-giamat source"
+echo " Linux HTL - by giamatamat2013"
 echo "=================================================="
 uname -a
 

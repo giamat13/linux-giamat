@@ -17,7 +17,7 @@ insmod video_bochs
 insmod video_cirrus
 set gfxpayload=1024x768x32
 
-menuentry "linux-giamat fork" {
+menuentry "Linux HTL" {
 	linux /boot/vmlinuz console=ttyS0 console=tty0
 	initrd /boot/initramfs.img
 }
