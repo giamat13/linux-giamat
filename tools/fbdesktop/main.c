@@ -102,8 +102,6 @@ static void do_hit_test(int x, int y)
 					timer_click(w, x, y);
 				} else if (w->type == WIN_SEARCH) {
 					search_click(w, x, y);
-				} else if (w->type == WIN_DISKUSAGE) {
-					du_click(w, x, y);
 				} else if (w->type == WIN_IMGVIEW) {
 					imgview_click(w, x, y);
 				} else if (w->type == WIN_ARCHIVE) {
@@ -164,8 +162,6 @@ void launch_icon(int idx)
 		spawn_timer();
 	} else if (ic->action == 12) {
 		spawn_search();
-	} else if (ic->action == 13) {
-		spawn_diskusage();
 	} else if (ic->action == 14) {
 		spawn_imgview(NULL);
 	} else if (ic->action == 15) {

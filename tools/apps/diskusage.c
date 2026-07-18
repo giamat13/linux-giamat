@@ -1,18 +1,21 @@
-/* fbdesktop -- Disk Usage: one bar per immediate child of the current path,
- * each sized by a full recursive walk (like `du --max-depth=1`). Clicking a
- * directory bar descends into it; the Up button in the toolbar climbs back.
+/* fbdesktop -- Folder Usage: a recursive per-directory size scan (like `du
+ * --max-depth=1`), rendered as one bar per immediate child. Lives in its own
+ * file because the scan is a distinct piece of work from the rest of the
+ * task manager, but it draws into whatever rectangle the Task Manager's Disk
+ * tab (taskmgr.c, view_disk) hands it -- there is no standalone window here
+ * any more; the per-filesystem statvfs view already covered "how full is the
+ * disk", so this only adds "which folder is using it", right below.
  *
  * ponytail: /proc, /sys, /dev, /run are reported as 0 rather than walked --
  * they're pseudo-filesystems, not real disk usage, and /proc in particular
  * can be slow to fully recurse. */
 #include "fbdesktop.h"
 
-#define DU_BG    0x1e1e2e
 #define DU_BAR   0x232338
 #define DU_TXT   0xcdd6f4
 #define DU_DIM   0x6c7086
-#define DU_TOOLH 32
-#define DU_ROWH  (font_h + 14)
+#define DU_TOOLH 26
+#define DU_ROWH  (font_h + 10)
 
 static void human_size(long long b, char *out, size_t n)
 {
@@ -63,7 +66,7 @@ static int cmp_duent(const void *a, const void *b)
 	return (q->size > p->size) - (q->size < p->size);
 }
 
-static void du_scan(struct dustate *s)
+void du_scan(struct dustate *s)
 {
 	s->count = 0;
 	s->scroll = 0;
@@ -93,16 +96,16 @@ static void du_scan(struct dustate *s)
 	snprintf(s->status, sizeof(s->status), "%d item%s", s->count, s->count == 1 ? "" : "s");
 }
 
-/* ---- input -------------------------------------------------------------- */
+/* ---- input: (x,y,w,h) is the same rectangle draw_du_panel was given -------- */
 
-void du_click(struct window *w, int px, int py)
+int du_panel_click(struct dustate *s, int rx, int ry, int rw, int rh, int px, int py)
 {
-	struct dustate *s = w->du;
-	int content_y = w->y + TITLE_H;
+	if (px < rx || px >= rx + rw || py < ry || py >= ry + rh)
+		return 0;
 
-	if (py >= content_y && py < content_y + DU_TOOLH) {
-		int btn_w = 60;
-		if (px < w->x + 8 + btn_w) {
+	if (py < ry + DU_TOOLH) {
+		int btn_w = 50;
+		if (px < rx + btn_w) {
 			char *slash = strrchr(s->path, '/');
 			if (slash && slash != s->path)
 				*slash = 0;
@@ -110,44 +113,40 @@ void du_click(struct window *w, int px, int py)
 				strcpy(s->path, "/");
 			du_scan(s);
 		}
-		return;
+		return 1;
 	}
 
-	int row = (py - (content_y + DU_TOOLH)) / DU_ROWH + s->scroll;
+	int row = (py - (ry + DU_TOOLH)) / DU_ROWH + s->scroll;
 	if (row < 0 || row >= s->count)
-		return;
+		return 1;
 	struct duent *e = &s->ents[row];
 	if (!e->isdir)
-		return;
+		return 1;
 	char child[FM_PATHLEN];
 	snprintf(child, sizeof(child), "%s/%s", s->path, e->name);
-	if (strlen(child) >= sizeof(s->path))
-		return;
-	memcpy(s->path, child, strlen(child) + 1);
-	du_scan(s);
+	if (strlen(child) < sizeof(s->path)) {
+		memcpy(s->path, child, strlen(child) + 1);
+		du_scan(s);
+	}
+	return 1;
 }
 
-/* ---- renderer ------------------------------------------------------------ */
+/* ---- renderer: draws only within (x,y,w,h), never touches the rest of the tab */
 
-void draw_diskusage(struct window *w, int content_y, int content_h)
+void draw_du_panel(struct dustate *s, uint32_t accent, int x, int y, int w, int h)
 {
-	struct dustate *s = w->du;
-	uint32_t accent = win_accent(w);
-
-	fill_rect(w->x, content_y, w->w, content_h, DU_BG);
-
-	/* ---- toolbar: Up button + breadcrumb ---- */
-	int btn_w = 60;
-	fill_round_rect_grad(w->x + 8, content_y + 4, btn_w, DU_TOOLH - 8, 5, 0x33334a, 0x2b2b3a);
+	draw_glyph(G_DISK, x + 14, y + 14, accent, mix(accent, 0x000000, 78));
+	int btn_w = 50;
+	fill_round_rect_grad(x + 32, y + 2, btn_w, DU_TOOLH - 4, 5, 0x33334a, 0x2b2b3a);
 	int lw = (int)strlen("Up") * font_w;
-	draw_text(w->x + 8 + (btn_w - lw) / 2, content_y + (DU_TOOLH - font_h) / 2, "Up", DU_TXT);
-	draw_text_clip(w->x + 8 + btn_w + 10, content_y + (DU_TOOLH - font_h) / 2, s->path,
-		       DU_DIM, w->w - btn_w - 24);
+	draw_text(x + 32 + (btn_w - lw) / 2, y + (DU_TOOLH - font_h) / 2, "Up", DU_TXT);
+	draw_text_clip(x + 32 + btn_w + 10, y + (DU_TOOLH - font_h) / 2, s->path, DU_DIM, w - btn_w - 60);
 
-	int list_y = content_y + DU_TOOLH;
-	int visible = (content_h - DU_TOOLH) > 0 ? (content_h - DU_TOOLH) / DU_ROWH : 0;
+	int list_y = y + DU_TOOLH;
+	int list_h = h - DU_TOOLH;
+	int visible = list_h > 0 ? list_h / DU_ROWH : 0;
 	if (s->count == 0) {
-		draw_text(w->x + 14, list_y + 6, s->status, DU_DIM);
+		draw_text(x, list_y + 6, s->status, DU_DIM);
 		return;
 	}
 	long long maxsz = s->ents[0].size ? s->ents[0].size : 1;
@@ -158,51 +157,18 @@ void draw_diskusage(struct window *w, int content_y, int content_h)
 		char sz[16];
 		human_size(e->size, sz, sizeof(sz));
 
-		int namew = 160;
-		int barx = w->x + 12 + namew, barmax = w->w - namew - 90;
-		draw_text_clip(w->x + 12, ry + (DU_ROWH - font_h) / 2, e->name,
+		int namew = 150;
+		int barx = x + namew, barmax = w - namew - 80;
+		draw_text_clip(x, ry + (DU_ROWH - font_h) / 2, e->name,
 			       e->isdir ? DU_TXT : DU_DIM, namew - 8);
-		int bw = (int)((double)e->size / maxsz * barmax);
+		int bw = barmax > 0 ? (int)((double)e->size / maxsz * barmax) : 0;
 		if (bw < 3)
 			bw = 3;
-		fill_round_rect(barx, ry + DU_ROWH / 2 - 6, barmax, 12, 3, DU_BAR);
-		fill_round_rect(barx, ry + DU_ROWH / 2 - 6, bw, 12, 3,
-				e->isdir ? accent : mix(accent, 0x000000, 100));
-		draw_text(w->x + w->w - 70, ry + (DU_ROWH - font_h) / 2, sz, DU_TXT);
-	}
-}
-
-int spawn_diskusage(void)
-{
-	for (int i = 0; i < MAX_WIN; i++) {
-		if (wins[i].used && wins[i].type == WIN_DISKUSAGE) {
-			wins[i].minimized = 0;
-			raise_window(i);
-			focused = i;
-			return i;
+		if (barmax > 0) {
+			fill_round_rect(barx, ry + DU_ROWH / 2 - 5, barmax, 10, 3, DU_BAR);
+			fill_round_rect(barx, ry + DU_ROWH / 2 - 5, bw, 10, 3,
+					e->isdir ? accent : mix(accent, 0x000000, 100));
 		}
+		draw_text(x + w - 64, ry + (DU_ROWH - font_h) / 2, sz, DU_TXT);
 	}
-	int slot = alloc_window_slot();
-	if (slot < 0)
-		return -1;
-	struct dustate *s = calloc(1, sizeof(struct dustate));
-	if (!s)
-		return -1;
-	snprintf(s->path, sizeof(s->path), "/root");
-	memset(&wins[slot], 0, sizeof(wins[slot]));
-	wins[slot].used = 1;
-	wins[slot].type = WIN_DISKUSAGE;
-	wins[slot].pty_fd = -1;
-	wins[slot].du = s;
-	wins[slot].x = 300;
-	wins[slot].y = 100;
-	wins[slot].w = 460;
-	wins[slot].h = 360;
-	wins[slot].attr_fg = COL_FG_DEFAULT;
-	wins[slot].attr_bg = COL_BG_DEFAULT;
-	snprintf(wins[slot].title, sizeof(wins[slot].title), "Disk Usage");
-	zorder[zcount++] = slot;
-	focused = slot;
-	du_scan(s);
-	return slot;
 }

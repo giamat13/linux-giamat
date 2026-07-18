@@ -423,19 +423,42 @@ static void view_performance(struct window *w, int px, int py, int pw, int ph)
 	}
 }
 
+/* Backs the "Folder Usage" section below the filesystem cards -- a single
+ * instance is enough since (like proc_sel and the CPU/mem history) there is
+ * only ever one Task Manager worth looking at. */
+static struct dustate du_state;
+
+/* Shared by view_disk (draw) and taskmgr_click so the two can't drift apart:
+ * the rectangle the folder-usage panel is drawn into and hit-tested against. */
+static void disk_panel_rect(struct window *w, int *rx, int *ry, int *rw, int *rh)
+{
+	int content_y = w->y + TITLE_H, content_h = w->h - TITLE_H;
+	int pad = 14, x = w->x + SB_W + 1 + pad, iw = w->w - SB_W - 1 - 2 * pad;
+	int fs_top = content_y + pad + font_h + 10;
+	int fs_area_h = (content_h - 2 * pad - font_h - 10) * 2 / 5;
+	int fs_bottom = fs_top + fs_area_h;
+	*rx = x;
+	*ry = fs_bottom + 6 + font_h + 8;
+	*rw = iw;
+	*rh = w->y + w->h - pad - *ry;
+}
+
 static void view_disk(struct window *w, int px, int py, int pw, int ph)
 {
-	(void)w;
 	int pad = 14, x = px + pad, iw = pw - 2 * pad;
 	draw_text(x, py + pad, "Filesystems", TXT);
 
+	/* Filesystem cards get a fixed top slice; the folder browser gets the
+	 * rest, so it stays visible regardless of how many mounts there are. */
+	int fs_top = py + pad + font_h + 10;
+	int fs_area_h = (ph - 2 * pad - font_h - 10) * 2 / 5;
+	int fs_bottom = fs_top + fs_area_h;
+
 	FILE *f = fopen("/proc/mounts", "r");
-	if (!f)
-		return;
 	char dev[128], mnt[128], fs[64];
-	int y = py + pad + font_h + 10;
+	int y = fs_top;
 	int cardh = 3 * font_h + 6;
-	while (y + cardh < py + ph - pad &&
+	while (f && y + cardh < fs_bottom &&
 	       fscanf(f, "%127s %127s %63s %*s %*d %*d", dev, mnt, fs) == 3) {
 		/* real block/image filesystems only -- skip proc/sysfs/cgroup/etc */
 		if (strcmp(fs, "ext4") && strcmp(fs, "ext3") && strcmp(fs, "ext2") &&
@@ -462,7 +485,18 @@ static void view_disk(struct window *w, int px, int py, int pw, int ph)
 		draw_text(x + iw - 12 - (int)strlen(pc) * font_w, y + cardh - font_h, pc, load_col(pct));
 		y += cardh + 10;
 	}
-	fclose(f);
+	if (f)
+		fclose(f);
+
+	/* ---- folder usage: merged in from the old standalone Disk Usage app ---- */
+	draw_text(x, fs_bottom + 6, "Folder Usage", TXT);
+	if (!du_state.path[0]) {
+		snprintf(du_state.path, sizeof(du_state.path), "/root");
+		du_scan(&du_state);
+	}
+	int rx, ry, rw, rh;
+	disk_panel_rect(w, &rx, &ry, &rw, &rh);
+	draw_du_panel(&du_state, win_accent(w), rx, ry, rw, rh);
 }
 
 static void kv(int x, int *y, int w, const char *k, const char *v)
@@ -585,6 +619,12 @@ void taskmgr_click(struct window *w, int px, int py)
 		return;
 	}
 
+	if (w->tab == 2) {
+		int rx, ry, rw, rh;
+		disk_panel_rect(w, &rx, &ry, &rw, &rh);
+		du_panel_click(&du_state, rx, ry, rw, rh, px, py);
+		return;
+	}
 	if (w->tab != 0)
 		return;
 

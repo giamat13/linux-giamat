@@ -75,7 +75,7 @@
 
 enum wintype { WIN_TERM, WIN_OUTPUT, WIN_FILES, WIN_TASKMGR, WIN_EDIT, WIN_SETTINGS,
 	       WIN_BROWSER, WIN_CALC, WIN_PAINT, WIN_CAL, WIN_TIMER, WIN_SEARCH,
-	       WIN_DISKUSAGE, WIN_IMGVIEW, WIN_ARCHIVE, WIN_SHOT };
+	       WIN_IMGVIEW, WIN_ARCHIVE, WIN_SHOT };
 
 enum glyph {
 	G_GAUGE, G_FOLDER, G_TERM, G_REFRESH, G_POWER, G_GEAR, G_FILE,
@@ -96,12 +96,12 @@ struct icon {
 	uint32_t color;
 	int action; /* 1=reboot,2=poweroff,3=terminal,4=files,5=task manager,
 		     * 6=settings,7=X app,8=calculator,9=paint,10=calendar,11=timer,
-		     * 12=search,13=disk usage,14=image viewer,15=archive manager,
-		     * 16=screenshot */
+		     * 12=search,14=image viewer,15=archive manager,16=screenshot
+		     * (13 was disk usage; merged into the task manager's Disk tab) */
 	int glyph;
 	int x, y;   /* free position on the desktop -- icons are draggable */
 };
-#define NUM_ICONS 16
+#define NUM_ICONS 15
 
 /* Desktop themes -- the only setting that has any effect at runtime; the
  * framebuffer mode itself is fixed by GRUB's gfxpayload at boot. */
@@ -377,7 +377,6 @@ struct window {
 	struct calstate *cal;     /* WIN_CAL only */
 	struct timerstate *timer;     /* WIN_TIMER only */
 	struct searchstate *search;   /* WIN_SEARCH only */
-	struct dustate *du;           /* WIN_DISKUSAGE only */
 	struct imgstate *img;         /* WIN_IMGVIEW only */
 	struct archivestate *arc;     /* WIN_ARCHIVE only */
 	struct shotstate *shot;       /* WIN_SHOT only */
@@ -601,10 +600,10 @@ void search_click(struct window *w, int px, int py);
 int search_keys(struct window *w, const char *buf, int n);
 int spawn_search(void);
 
-/* diskusage.c */
-void draw_diskusage(struct window *w, int content_y, int content_h);
-void du_click(struct window *w, int px, int py);
-int spawn_diskusage(void);
+/* diskusage.c -- Folder Usage panel embedded in the Task Manager's Disk tab */
+void du_scan(struct dustate *s);
+void draw_du_panel(struct dustate *s, uint32_t accent, int x, int y, int w, int h);
+int du_panel_click(struct dustate *s, int rx, int ry, int rw, int rh, int px, int py);
 
 /* imgview.c */
 void draw_imgview(struct window *w, int content_y, int content_h);

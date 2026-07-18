@@ -60,10 +60,6 @@ void close_window(int i)
 		free(wins[i].search);
 		wins[i].search = NULL;
 	}
-	if (wins[i].du) {
-		free(wins[i].du);
-		wins[i].du = NULL;
-	}
 	if (wins[i].img) {
 		free(wins[i].img->rgb);
 		free(wins[i].img);
@@ -218,11 +214,6 @@ void draw_window(struct window *w)
 
 	if (w->type == WIN_SEARCH && w->search) {
 		draw_search(w, content_y, content_h);
-		return;
-	}
-
-	if (w->type == WIN_DISKUSAGE && w->du) {
-		draw_diskusage(w, content_y, content_h);
 		return;
 	}
 
